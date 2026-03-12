@@ -180,7 +180,7 @@ services:
   feast-ui:
     build:
       context: ../..
-      dockerfile: infra/docker/feast/Dockerfile
+      dockerfile: feast/Dockerfile
     command: ["feast", "ui", "--host", "0.0.0.0", "--port", "8888"]
     working_dir: /app/feast/feature_repo
     environment:
@@ -208,7 +208,7 @@ services:
   feast-server:
     build:
       context: ../..
-      dockerfile: infra/docker/feast/Dockerfile
+      dockerfile: feast/Dockerfile
     command: ["feast", "serve", "--host", "0.0.0.0", "--port", "6566"]
     working_dir: /app/feast/feature_repo
     environment:
