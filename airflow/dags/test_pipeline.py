@@ -6,6 +6,8 @@ import datetime
 import uuid
 
 from airflow.decorators import dag, task
+from shared.kafka.producer import publish_event
+from shared.kafka.topics import KafkaTopics
 
 
 @dag(
@@ -19,27 +21,13 @@ from airflow.decorators import dag, task
 def test_pipeline() -> None:
     @task()
     def send_test_event() -> None:
-        import json
-        import os
-
-        from kafka import KafkaProducer
-
-        bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-
-        producer = KafkaProducer(
-            bootstrap_servers=bootstrap,
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        )
-
         event = {
             "event_id": str(uuid.uuid4()),
             "timestamp": datetime.datetime.utcnow().isoformat(),
             "source": "test_pipeline",
             "payload": {"message": "heartbeat"},
         }
-        producer.send("raw.test.event", value=event)
-        producer.flush()
-        producer.close()
+        publish_event(KafkaTopics.TEST.value, event)
 
     send_test_event()
 
