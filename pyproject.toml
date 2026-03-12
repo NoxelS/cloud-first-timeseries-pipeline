@@ -1,0 +1,116 @@
+[project]
+name = "cloud-first-timeseries-pipeline"
+version = "0.1.0"
+description = "Cloud-first, event-driven platform for collecting time series data, building feature pipelines, and preparing datasets for forecasting. Built with Kafka, Airflow, Feast, and Docker."
+authors = [{ name = "Noel Schwabenland", email = "noel@schwabenland.ch" }]
+readme = "README.md"
+keywords = ['python']
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "kafka-python>=2.3.0",
+    "shared",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = [
+    "shared",
+    "services/eurostat_collector",
+    "services/example_source_collector",
+    "services/test-consumer",
+]
+
+[tool.uv.sources]
+shared = { workspace = true }
+
+[project.urls]
+Homepage = "https://NoxelS.github.io/cloud-first-timeseries-pipeline/"
+Repository = "https://github.com/NoxelS/cloud-first-timeseries-pipeline"
+Documentation = "https://NoxelS.github.io/cloud-first-timeseries-pipeline/"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.6.0",
+    "pre-commit>=4.5.1",
+    "tox-uv>=1.29.0",
+    
+    "ty>=0.0.14",
+    "ruff>=0.14.14",
+    "bandit[toml]>=1.8.0",
+    "pip-audit>=2.9.0",
+    "vulture>=2.14",
+    "hypothesis>=6.131.0",
+    "mutmut>=3.3.0",  
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --disable-warnings"
+markers = [
+    "coverage: marks tests as critical for coverage (deselect with '-m \"not coverage\"')",
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks integration tests (deselect with '-m \"not integration\"')",
+    "property: marks property-based tests using Hypothesis (deselect with '-m \"not property\"')",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+fix = true
+
+[tool.ruff.lint]
+select = [
+    # flake8-2020
+    "YTT",
+    # flake8-bandit
+    "S",
+    # flake8-bugbear
+    "B",
+    # flake8-builtins
+    "A",
+    # flake8-comprehensions
+    "C4",
+    # flake8-debugger
+    "T10",
+    # flake8-pie
+    "PIE",
+    # flake8-simplify
+    "SIM",
+    # isort
+    "I",
+    # mccabe
+    "C90",
+    # pycodestyle
+    "E", "W",
+    # pyflakes
+    "F",
+    # pygrep-hooks
+    "PGH",
+    # pyupgrade
+    "UP",
+    # ruff
+    "RUF",
+    # tryceratops
+    "TRY",
+]
+ignore = [
+    # LineTooLong
+    "E501",
+    # DoNotAssignLambda
+    "E731",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S101"]
+
+[tool.ruff.format]
+preview = true
+
+[tool.bandit]
+exclude_dirs = ["tests", "venv"]
+
+

@@ -1,0 +1,1 @@
+"""Airflow plugin package placeholder."""
