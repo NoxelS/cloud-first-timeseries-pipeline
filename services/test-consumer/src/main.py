@@ -10,14 +10,15 @@ import logging
 import os
 
 from kafka import KafkaConsumer
+from shared.kafka.topics import KafkaTopics
 
 
 def _bootstrap_servers() -> str:
-    return os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-broker:29092")
+    return os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
 
 def _topic_name() -> str:
-    return os.environ.get("KAFKA_TOPIC", "raw.test.event")
+    return os.environ.get("KAFKA_TOPIC", KafkaTopics.TEST.value)
 
 
 def main() -> None:

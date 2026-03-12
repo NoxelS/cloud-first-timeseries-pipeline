@@ -15,7 +15,7 @@ def publish_event(topic: str, payload: dict) -> None:
     from kafka import KafkaProducer
     from kafka.errors import KafkaError
 
-    bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-broker:29092")
+    bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
     producer = KafkaProducer(
         bootstrap_servers=bootstrap,

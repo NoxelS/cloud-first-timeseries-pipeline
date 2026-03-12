@@ -24,7 +24,7 @@ def test_pipeline() -> None:
 
         from kafka import KafkaProducer
 
-        bootstrap = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka-broker:29092")
+        bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
         producer = KafkaProducer(
             bootstrap_servers=bootstrap,

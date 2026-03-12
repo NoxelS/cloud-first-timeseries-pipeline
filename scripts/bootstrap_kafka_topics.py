@@ -17,7 +17,7 @@ KAFKA_DEFAULT_REPLICATION = 1
 
 
 def _get_bootstrap_servers() -> str:
-    return "kafka-broker:29092"
+    return os.environ["KAFKA_BOOTSTRAP_SERVERS"]
 
 
 def _collect_topic_names() -> Iterable[str]:
@@ -26,11 +26,7 @@ def _collect_topic_names() -> Iterable[str]:
     Any module-level UPPER_CASE string value is considered a topic name.
     """
 
-    names = []
-    for k, v in vars(KafkaTopics).items():
-        if k.isupper() and isinstance(v, str) and v:
-            names.append(v)
-    return names
+    return [topic.value for topic in KafkaTopics]
 
 
 def main() -> None:
