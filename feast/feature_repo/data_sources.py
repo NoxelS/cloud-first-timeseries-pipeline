@@ -1,9 +1,9 @@
 """Feast data source placeholders."""
 
-from feast import FileSource
+from feast.infra.offline_stores.contrib.postgres_offline_store.postgres_source import PostgreSQLSource
 
-raw_event_source = FileSource(
+raw_event_source = PostgreSQLSource(
     name="raw_event_source",
-    path="data/raw_events.parquet",
+    query="SELECT series_id, value, event_timestamp FROM raw_events",
     timestamp_field="event_timestamp",
 )

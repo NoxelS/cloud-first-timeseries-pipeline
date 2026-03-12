@@ -1,8 +1,18 @@
 project: cloud_first_timeseries
-registry: data/registry.db
 provider: local
+registry:
+  registry_type: sql
+  path: ${FEAST_REGISTRY_DB_URL}
+  cache_ttl_seconds: 60
 online_store:
-  type: sqlite
-  path: data/online_store.db
+  type: redis
+  connection_string: ${FEAST_REDIS_CONNECTION_STRING}
 offline_store:
-  type: file
+  type: postgres
+  host: ${FEAST_OFFLINE_STORE_HOST}
+  port: ${FEAST_OFFLINE_STORE_PORT}
+  database: ${FEAST_OFFLINE_STORE_DATABASE}
+  db_schema: ${FEAST_OFFLINE_STORE_SCHEMA}
+  user: ${FEAST_OFFLINE_STORE_USER}
+  password: ${FEAST_OFFLINE_STORE_PASSWORD}
+  sslmode: disable

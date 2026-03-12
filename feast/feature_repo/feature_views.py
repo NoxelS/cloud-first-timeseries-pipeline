@@ -5,8 +5,8 @@ from datetime import timedelta
 from feast import FeatureView, Field
 from feast.types import Float32
 
-from .data_sources import raw_event_source
-from .entities import series_id
+from data_sources import raw_event_source
+from entities import series_id
 
 series_features = FeatureView(
     name="series_features",

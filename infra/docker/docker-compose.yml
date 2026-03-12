@@ -167,6 +167,8 @@ services:
     image: redis:7.2-bookworm
     expose:
       - 6379
+    volumes:
+      - redis-data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -174,6 +176,75 @@ services:
       retries: 50
       start_period: 30s
     restart: always
+
+  feast-ui:
+    build:
+      context: ../..
+      dockerfile: infra/docker/feast/Dockerfile
+    command: ["feast", "ui", "--host", "0.0.0.0", "--port", "8888"]
+    working_dir: /app/feast/feature_repo
+    environment:
+      FEAST_REGISTRY_DB_URL: ${FEAST_REGISTRY_DB_URL}
+      FEAST_REDIS_CONNECTION_STRING: ${FEAST_REDIS_CONNECTION_STRING}
+      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
+      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
+      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
+      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
+      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
+      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
+    ports:
+      - "${FEAST_UI_PORT:-8888}:8888"
+    volumes:
+      - ../../feast:/app/feast
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres-feast-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  feast-server:
+    build:
+      context: ../..
+      dockerfile: infra/docker/feast/Dockerfile
+    command: ["feast", "serve", "--host", "0.0.0.0", "--port", "6566"]
+    working_dir: /app/feast/feature_repo
+    environment:
+      FEAST_REGISTRY_DB_URL: ${FEAST_REGISTRY_DB_URL}
+      FEAST_REDIS_CONNECTION_STRING: ${FEAST_REDIS_CONNECTION_STRING}
+      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
+      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
+      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
+      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
+      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
+      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
+    ports:
+      - "${FEAST_SERVER_PORT:-6566}:6566"
+    volumes:
+      - ../../feast:/app/feast
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres-feast-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  postgres-feast-init:
+    image: postgres:16
+    environment:
+      PGPASSWORD: airflow
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        psql -h postgres -U airflow -d airflow -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS feast;"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   airflow-apiserver:
     <<: *airflow-common
@@ -392,3 +463,4 @@ services:
 volumes:
   postgres-db-volume:
   kafka_data:
+  redis-data:

@@ -3,6 +3,12 @@ COMPOSE := docker compose --env-file infra/docker/.env -p forecasting -f $(COMPO
 
 .PHONY: local-deploy
 .PHONY: down
+.PHONY: feast-up
+.PHONY: feast-down
+.PHONY: feast-server-up
+.PHONY: feast-apply
+.PHONY: feast-plan
+.PHONY: feast-list
 
 deploy:
 	$(COMPOSE) down
@@ -24,3 +30,21 @@ down:
 
 hard-down:
 	$(COMPOSE) down -v --remove-orphans
+
+feast-up:
+	$(COMPOSE) up -d postgres-feast-init feast-ui
+
+feast-server-up:
+	$(COMPOSE) up -d feast-server
+
+feast-down:
+	$(COMPOSE) stop feast-ui feast-server
+
+feast-apply:
+	$(COMPOSE) run --rm feast-ui feast apply --skip-source-validation
+
+feast-plan:
+	$(COMPOSE) run --rm feast-ui feast plan --skip-source-validation
+
+feast-list:
+	$(COMPOSE) run --rm feast-ui feast entities list && $(COMPOSE) run --rm feast-ui feast feature-views list
