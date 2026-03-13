@@ -9,6 +9,7 @@ requires-python = ">=3.10,<4.0"
 dependencies = [
     "feast[postgres,redis]>=0.61.0,<0.62.0",
     "kafka-python>=2.3.0",
+    "responses>=0.26.0",
     "shared",
 ]
 
@@ -21,6 +22,7 @@ members = [
     "services/eurostat_collector",
     "services/example_source_collector",
     "services/test-consumer",
+    "services/energy_charts_collector",
 ]
 
 [tool.uv.sources]

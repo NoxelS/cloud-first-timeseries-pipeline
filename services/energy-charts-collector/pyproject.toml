@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "energy-charts-collector"
+version = "0.0.1"
+description = "Collector service for Energy-Charts API (unit-testable components)"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "requests>=2.28",
+    "httpx",
+    "attrs",
+    "python-dateutil",
+    "psycopg[binary]>=3.2",
+    "kafka-python>=2.0.2"
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "responses", "pytest-mock"]
+
+[tool.uv]
+package = false

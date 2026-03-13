@@ -74,11 +74,18 @@ x-airflow-common:
     # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
     # uvicorn>=0.29.0 is required for Airflow 3.x api-server (timeout_worker_healthcheck argument)
-    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-uvicorn>=0.29.0}
+    _PIP_ADDITIONAL_REQUIREMENTS: "uvicorn>=0.29.0 kafka-python>=2.0.2 psycopg[binary]>=3.2 ${_PIP_ADDITIONAL_REQUIREMENTS:-}"
     # The following line can be used to set a custom config file, stored in the local config folder
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     PYTHONPATH: /opt/airflow
     KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+    FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
+    FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
+    FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
+    FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
+    FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
+    FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
+    RAW_SCHEMA: ${RAW_SCHEMA:-raw}
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
@@ -144,6 +151,25 @@ services:
         condition: service_healthy
       kafka-bootstrap:
         condition: service_completed_successfully
+    restart: unless-stopped
+
+  energy-charts-collector:
+    build:
+      context: ../..
+      dockerfile: services/energy-charts-collector/Dockerfile
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
+      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
+      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
+      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
+      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
+      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
+    # depends_on:
+    #   kafka-broker:
+    #     condition: service_healthy
+    #   kafka-bootstrap:
+    #     condition: service_completed_successfully
     restart: unless-stopped
 
   postgres:

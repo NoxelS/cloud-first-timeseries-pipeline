@@ -138,3 +138,13 @@ kafka-consumer-group-describe:
 kafka-consumer-group-delete:
 	@if [ -z "$(GROUP)" ]; then echo "Usage: make kafka-consumer-group-delete GROUP=<group_name>"; exit 1; fi
 	$(COMPOSE) exec -T $(KAFKA_SERVICE) bash -lc '$(KAFKA_BIN)/kafka-consumer-groups.sh --bootstrap-server $(KAFKA_BOOTSTRAP) --delete --group "$(GROUP)"'
+
+openapi-generator-open-charts:
+	uvx run openapi-python-client generate --url https://api.energy-charts.info/openapi.json --output-path adapters/energy-charts-collector
+
+
+up-collectors:
+	$(COMPOSE) down energy-charts-collector
+	$(COMPOSE) pull --ignore-pull-failures energy-charts-collector
+	$(COMPOSE) build --no-cache energy-charts-collector
+	$(COMPOSE) up --force-recreate energy-charts-collector

@@ -11,3 +11,6 @@ from enum import Enum
 
 class KafkaTopics(str, Enum):
     TEST = "raw.test.event"
+    CMD_FEATURE_COLLECTION = "cmd.feature_collection"
+    RAW_ENERGY_CHARTS = "raw.energy_charts"
+    FEATURES_ENERGY_CHARTS = "features.energy_charts"
