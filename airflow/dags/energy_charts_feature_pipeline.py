@@ -1,18 +1,20 @@
-"""Ingest raw energy-charts frequency events and build Feast features."""
+"""Collect Energy Charts frequency data, build features, materialize, and emit training triggers."""
+
+# ruff: noqa: S608
 
 from __future__ import annotations
 
 import datetime
-import json
 import logging
 import os
-from typing import Any, Dict, Iterable, List
+import uuid
+from typing import Any
 
 import psycopg
 from airflow.decorators import dag, task
-from kafka import KafkaConsumer
-from kafka.structs import OffsetAndMetadata, TopicPartition
 
+from shared.adapters.energy_charts.collector import collect_frequency_events
+from shared.kafka.producer import publish_event
 from shared.kafka.topics import KafkaTopics
 
 logger = logging.getLogger(__name__)
@@ -20,8 +22,8 @@ logger = logging.getLogger(__name__)
 
 _RAW_SCHEMA = os.environ.get("RAW_SCHEMA", "raw")
 _FEAST_SCHEMA = os.environ.get("FEAST_OFFLINE_STORE_SCHEMA", "feast")
-_MAX_MESSAGES = int(os.environ.get("ENERGY_CHARTS_MAX_MESSAGES", "5000"))
-_CONSUMER_TIMEOUT_MS = int(os.environ.get("ENERGY_CHARTS_CONSUMER_TIMEOUT_MS", "1000"))
+_FEAST_REPO_PATH = os.environ.get("FEAST_REPO_PATH", "/opt/airflow/feast/feature_repo")
+_ENABLE_MATERIALIZATION = os.environ.get("ENABLE_FEAST_MATERIALIZATION", "false").lower() == "true"
 
 
 def _db_connection() -> psycopg.Connection:
@@ -96,67 +98,31 @@ def _parse_iso_ts(value: str) -> datetime.datetime:
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def _dedupe_events(events: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    unique: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for event in events:
-        event_id = event.get("event_id")
-        if not event_id or event_id in seen:
-            continue
-        seen.add(event_id)
-        unique.append(event)
-    return unique
-
-
 @dag(
-    dag_id="energy_charts_pipeline",
-    description="Consume raw energy-charts events and build Feast features.",
+    dag_id="energy-charts-feature-pipeline",
+    description="Collect frequency data, build features, materialize, and trigger model training.",
     schedule="*/5 * * * *",
     start_date=datetime.datetime(2026, 3, 13),
     catchup=False,
     tags=["energy-charts"],
 )
-def energy_charts_pipeline() -> None:
+def energy_charts_feature_pipeline() -> None:  # noqa: C901
     @task()
-    def consume_raw_events() -> Dict[str, Any]:
-        bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-        consumer = KafkaConsumer(
-            KafkaTopics.RAW_ENERGY_CHARTS.value,
-            bootstrap_servers=bootstrap,
-            auto_offset_reset="earliest",
-            enable_auto_commit=False,
-            group_id="energy-charts-pipeline",
-            consumer_timeout_ms=_CONSUMER_TIMEOUT_MS,
-            value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-        )
-
-        events: List[Dict[str, Any]] = []
-        offsets: Dict[tuple[str, int], int] = {}
-
-        try:
-            for message in consumer:
-                events.append(message.value)
-                offsets[(message.topic, message.partition)] = message.offset + 1
-                if len(events) >= _MAX_MESSAGES:
-                    break
-        finally:
-            consumer.close()
-
-        logger.info("Consumed %d raw events", len(events))
-        return {
-            "events": events,
-            "offsets": [
-                {"topic": topic, "partition": partition, "offset": offset}
-                for (topic, partition), offset in offsets.items()
-            ],
+    def collect_raw_events() -> dict[str, Any]:
+        command = {
+            "request_id": str(uuid.uuid4()),
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+            "region": os.environ.get("ENERGY_CHARTS_REGION", "DE-Freiburg"),
         }
+        payload = collect_frequency_events(command)
+        logger.info("Collected %d raw frequency events", len(payload.get("events", [])))
+        return payload
 
     @task()
-    def write_raw_table(payload: Dict[str, Any]) -> Dict[str, Any]:
-        events = _dedupe_events(payload.get("events", []))
-        payload["events"] = events
+    def write_raw_table(payload: dict[str, Any]) -> dict[str, Any]:
+        events = payload.get("events", [])
         if not events:
-            payload["written"] = False
+            payload["written_raw"] = False
             return payload
 
         with _db_connection() as conn:
@@ -192,21 +158,17 @@ def energy_charts_pipeline() -> None:
                 )
             conn.commit()
 
-        payload["written"] = True
+        payload["written_raw"] = True
         return payload
 
     @task()
-    def aggregate_to_features(payload: Dict[str, Any]) -> Dict[str, Any]:
-        if not payload.get("written"):
+    def aggregate_to_features(payload: dict[str, Any]) -> dict[str, Any]:
+        if not payload.get("written_raw"):
+            payload["affected_feature_rows"] = 0
             return payload
 
-        events = payload.get("events", [])
-        if not events:
-            return payload
-
-        timestamps = [_parse_iso_ts(event["event_timestamp"]) for event in events]
-        window_start = min(timestamps)
-        window_end = max(timestamps) + datetime.timedelta(seconds=1)
+        window_start = _parse_iso_ts(payload["window_start"])
+        window_end = _parse_iso_ts(payload["window_end"])
 
         with _db_connection() as conn:
             _ensure_feature_table(conn)
@@ -237,49 +199,69 @@ def energy_charts_pipeline() -> None:
                         frequency_hz = EXCLUDED.frequency_hz,
                         source_region = EXCLUDED.source_region,
                         created_at = NOW()
+                    WHERE {_FEAST_SCHEMA}.grid_frequency_5m.frequency_hz IS DISTINCT FROM EXCLUDED.frequency_hz
+                       OR {_FEAST_SCHEMA}.grid_frequency_5m.source_region IS DISTINCT FROM EXCLUDED.source_region
                     """,
                     (window_start, window_end),
                 )
+                affected_rows = cursor.rowcount
             conn.commit()
 
+        payload["affected_feature_rows"] = max(affected_rows, 0)
+        logger.info("Affected %d feature rows", payload["affected_feature_rows"])
         return payload
 
     @task()
-    def commit_offsets(payload: Dict[str, Any]) -> None:
-        if not payload.get("written"):
-            logger.info("Skipping offset commit; no events written.")
-            return
+    def materialize_features(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("affected_feature_rows", 0) <= 0:
+            payload["materialized"] = False
+            return payload
 
-        offsets = payload.get("offsets", [])
-        if not offsets:
-            logger.info("Skipping offset commit; no offsets.")
-            return
+        if not _ENABLE_MATERIALIZATION:
+            logger.info("Skipping Feast materialization because ENABLE_FEAST_MATERIALIZATION is false.")
+            payload["materialized"] = False
+            return payload
 
-        bootstrap = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-        consumer = KafkaConsumer(
-            KafkaTopics.RAW_ENERGY_CHARTS.value,
-            bootstrap_servers=bootstrap,
-            enable_auto_commit=False,
-            group_id="energy-charts-pipeline",
-        )
         try:
-            commit_map = {
-                TopicPartition(entry["topic"], entry["partition"]): OffsetAndMetadata(
-                    entry["offset"],
-                    None,
-                    -1,
-                )
-                for entry in offsets
-            }
-            consumer.commit(offsets=commit_map)
-            logger.info("Committed offsets for %d partitions", len(commit_map))
-        finally:
-            consumer.close()
+            from feast import FeatureStore
+        except ImportError:
+            logger.warning("Skipping Feast materialization because Feast is not installed in Airflow runtime.")
+            payload["materialized"] = False
+            return payload
 
-    payload = consume_raw_events()
+        window_end = _parse_iso_ts(payload["window_end"])
+        store = FeatureStore(repo_path=_FEAST_REPO_PATH)
+        store.materialize_incremental(end_date=window_end)
+        payload["materialized"] = True
+        return payload
+
+    @task()
+    def publish_training_trigger(payload: dict[str, Any]) -> None:
+        if not payload.get("materialized"):
+            logger.info("Skipping training trigger; no new feature data was materialized.")
+            return
+
+        events = payload.get("events", [])
+        series_id = events[0]["series_id"] if events else None
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+            "source": "energy-charts-feature-pipeline",
+            "pipeline": "energy-charts-feature-pipeline",
+            "window_start": payload["window_start"],
+            "window_end": payload["window_end"],
+            "series_id": series_id,
+            "affected_feature_rows": payload.get("affected_feature_rows", 0),
+            "materialized": True,
+        }
+        publish_event(KafkaTopics.CMD_MODEL_TRAINING.value, event)
+        logger.info("Published training trigger event to %s", KafkaTopics.CMD_MODEL_TRAINING.value)
+
+    payload = collect_raw_events()
     payload = write_raw_table(payload)
     payload = aggregate_to_features(payload)
-    commit_offsets(payload)
+    payload = materialize_features(payload)
+    publish_training_trigger(payload)
 
 
-energy_charts_pipeline()
+energy_charts_feature_pipeline()

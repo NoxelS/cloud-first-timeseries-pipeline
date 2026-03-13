@@ -1,7 +1,0 @@
-{
-  "unix_seconds": [1678588800, 1678589100, 1678589400],
-  "production_types": [
-    {"name": "solar", "data": [0.0, 1.2, 3.4]},
-    {"name": "wind_onshore", "data": [5.0, 4.8, 4.9]}
-  ]
-}

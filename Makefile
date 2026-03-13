@@ -141,10 +141,3 @@ kafka-consumer-group-delete:
 
 openapi-generator-open-charts:
 	uvx run openapi-python-client generate --url https://api.energy-charts.info/openapi.json --output-path adapters/energy-charts-collector
-
-
-up-collectors:
-	$(COMPOSE) down energy-charts-collector
-	$(COMPOSE) pull --ignore-pull-failures energy-charts-collector
-	$(COMPOSE) build --no-cache energy-charts-collector
-	$(COMPOSE) up --force-recreate energy-charts-collector
