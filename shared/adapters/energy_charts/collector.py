@@ -13,7 +13,6 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.energy-charts.info/frequency"
 _DEFAULT_REGION = "DE-Freiburg"
-_WINDOW_MINUTES = 5
 _REQUEST_TIMEOUT_SECONDS = 30
 
 
@@ -30,25 +29,10 @@ def _make_series_id(country: str, production_type: str) -> str:
     return f"{country}::{production_type}"
 
 
-def parse_command_timestamp(command: dict[str, Any]) -> datetime.datetime:
-    raw_ts = command.get("timestamp")
-    if not raw_ts:
-        return datetime.datetime.now(tz=datetime.timezone.utc)
-
-    if isinstance(raw_ts, str):
-        try:
-            return _parse_iso_ts(raw_ts)
-        except ValueError:
-            logger.warning("Invalid command timestamp '%s', falling back to now()", raw_ts)
-            return datetime.datetime.now(tz=datetime.timezone.utc)
-
-    logger.warning("Unsupported timestamp type '%s', falling back to now()", type(raw_ts))
-    return datetime.datetime.now(tz=datetime.timezone.utc)
-
-
-def window_bounds(end_ts: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime]:
-    start_ts = end_ts - datetime.timedelta(minutes=_WINDOW_MINUTES)
-    return start_ts, end_ts
+def _coerce_utc(value: datetime.datetime) -> datetime.datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value.astimezone(datetime.timezone.utc)
 
 
 def _zip_points(unix_seconds: list[int], values: list[float | None]) -> list[tuple[int, float | None]]:
@@ -61,8 +45,8 @@ def _zip_points(unix_seconds: list[int], values: list[float | None]) -> list[tup
     return list(zip(unix_seconds, values, strict=False))
 
 
-def fetch_frequency_points(*, region: str, start_date: str, end_date: str) -> tuple[list[int], list[float | None]]:
-    params = urlencode({"region": region, "start": start_date, "end": end_date})
+def fetch_frequency_points(*, region: str, start: str, end: str) -> tuple[list[int], list[float | None]]:
+    params = urlencode({"region": region, "start": start, "end": end})
     url = f"{_BASE_URL}?{params}"
     try:
         with urlopen(url, timeout=_REQUEST_TIMEOUT_SECONDS) as response:  # noqa: S310
@@ -96,9 +80,12 @@ def build_raw_events(
     series = _make_series_id(region.lower(), "grid_frequency")
     events: list[dict[str, Any]] = []
 
+    start_utc = _coerce_utc(window_start)
+    end_utc = _coerce_utc(window_end)
+
     for second, value in _zip_points(unix_seconds, values):
         point_ts = datetime.datetime.fromtimestamp(second, tz=datetime.timezone.utc)
-        if point_ts < window_start or point_ts >= window_end:
+        if point_ts < start_utc or point_ts >= end_utc:
             continue
         event_fingerprint = f"{series}:{point_ts.isoformat()}"
         events.append({
@@ -114,31 +101,80 @@ def build_raw_events(
     return events
 
 
-def collect_frequency_events(command: dict[str, Any]) -> dict[str, Any]:
-    region = command.get("region", _DEFAULT_REGION)
-    request_id = command.get("request_id", str(uuid.uuid4()))
-    end_ts = parse_command_timestamp(command)
-    window_start, window_end = window_bounds(end_ts)
+def collect_frequency_events_for_range(
+    *,
+    window_start: datetime.datetime,
+    window_end: datetime.datetime,
+    region: str = _DEFAULT_REGION,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    start_utc = _coerce_utc(window_start)
+    end_utc = _coerce_utc(window_end)
+    request = request_id or str(uuid.uuid4())
 
-    start_date = window_start.date().isoformat()
-    end_date = window_end.date().isoformat()
-    unix_seconds, frequencies = fetch_frequency_points(region=region, start_date=start_date, end_date=end_date)
+    if start_utc >= end_utc:
+        return {
+            "events": [],
+            "request_id": request,
+            "source_region": region,
+            "window_start": start_utc.isoformat(),
+            "window_end": end_utc.isoformat(),
+        }
 
+    events: list[dict[str, Any]] = []
+    day = start_utc.date()
+    final_day = (end_utc - datetime.timedelta(microseconds=1)).date()
     collected_at = datetime.datetime.now(tz=datetime.timezone.utc)
-    events = build_raw_events(
-        unix_seconds=unix_seconds,
-        values=frequencies,
-        region=region,
-        request_id=request_id,
-        window_start=window_start,
-        window_end=window_end,
-        collected_at=collected_at,
-    )
+
+    while day <= final_day:
+        day_start = datetime.datetime.combine(day, datetime.time.min, tzinfo=datetime.timezone.utc)
+        day_end = day_start + datetime.timedelta(days=1)
+        slice_start = max(start_utc, day_start)
+        slice_end = min(end_utc, day_end)
+        start_unix = int(slice_start.timestamp())
+        end_unix = int(slice_end.timestamp()) - 1
+        if start_unix > end_unix:
+            day += datetime.timedelta(days=1)
+            continue
+
+        unix_seconds, frequencies = fetch_frequency_points(
+            region=region,
+            start=str(start_unix),
+            end=str(end_unix),
+        )
+        events.extend(
+            build_raw_events(
+                unix_seconds=unix_seconds,
+                values=frequencies,
+                region=region,
+                request_id=request,
+                window_start=start_utc,
+                window_end=end_utc,
+                collected_at=collected_at,
+            )
+        )
+        day += datetime.timedelta(days=1)
 
     return {
         "events": events,
-        "request_id": request_id,
+        "request_id": request,
         "source_region": region,
-        "window_start": window_start.isoformat(),
-        "window_end": window_end.isoformat(),
+        "window_start": start_utc.isoformat(),
+        "window_end": end_utc.isoformat(),
     }
+
+
+def collect_frequency_events_for_day(
+    *,
+    day: datetime.date,
+    region: str = _DEFAULT_REGION,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    day_start = datetime.datetime.combine(day, datetime.time.min, tzinfo=datetime.timezone.utc)
+    day_end = day_start + datetime.timedelta(days=1)
+    return collect_frequency_events_for_range(
+        window_start=day_start,
+        window_end=day_end,
+        region=region,
+        request_id=request_id,
+    )

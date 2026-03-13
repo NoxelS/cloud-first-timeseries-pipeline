@@ -1,4 +1,4 @@
-"""Collect Energy Charts frequency data, build features, materialize, and emit training triggers."""
+"""Incrementally ingest second-level Energy Charts frequency data into the raw store."""
 
 # ruff: noqa: S608
 
@@ -13,17 +13,17 @@ from typing import Any
 import psycopg
 from airflow.decorators import dag, task
 
-from shared.adapters.energy_charts.collector import collect_frequency_events
+from shared.adapters.energy_charts.collector import collect_frequency_events_for_range
 from shared.kafka.producer import publish_event
 from shared.kafka.topics import KafkaTopics
 
 logger = logging.getLogger(__name__)
 
-
 _RAW_SCHEMA = os.environ.get("RAW_SCHEMA", "raw")
-_FEAST_SCHEMA = os.environ.get("FEAST_OFFLINE_STORE_SCHEMA", "feast")
-_FEAST_REPO_PATH = os.environ.get("FEAST_REPO_PATH", "/opt/airflow/feast/feature_repo")
-_ENABLE_MATERIALIZATION = os.environ.get("ENABLE_FEAST_MATERIALIZATION", "false").lower() == "true"
+_PIPELINE_NAME = "energy-charts-feature-pipeline"
+_OVERLAP_SECONDS = int(os.environ.get("ENERGY_CHARTS_OVERLAP_SECONDS", "60"))
+_SAFETY_LAG_SECONDS = int(os.environ.get("ENERGY_CHARTS_SAFETY_LAG_SECONDS", "30"))
+_INITIAL_LOOKBACK_HOURS = int(os.environ.get("ENERGY_CHARTS_INITIAL_LOOKBACK_HOURS", "24"))
 
 
 def _db_connection() -> psycopg.Connection:
@@ -36,19 +36,28 @@ def _db_connection() -> psycopg.Connection:
     )
 
 
-def _ensure_raw_table(conn: psycopg.Connection) -> None:
+def _parse_iso_ts(value: str) -> datetime.datetime:
+    parsed = value.replace("Z", "+00:00") if value.endswith("Z") else value
+    dt = datetime.datetime.fromisoformat(parsed)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def _ensure_tables(conn: psycopg.Connection) -> None:
     with conn.cursor() as cursor:
         cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_RAW_SCHEMA}")
         cursor.execute(
             f"""
             CREATE TABLE IF NOT EXISTS {_RAW_SCHEMA}.energy_charts_frequency (
-                event_id TEXT PRIMARY KEY,
+                event_id TEXT NOT NULL,
                 series_id TEXT NOT NULL,
                 event_timestamp TIMESTAMPTZ NOT NULL,
                 frequency_hz DOUBLE PRECISION NULL,
                 source_region TEXT NOT NULL,
                 request_id TEXT NOT NULL,
-                collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT uq_energy_charts_frequency_series_ts UNIQUE (series_id, event_timestamp)
             )
             """
         )
@@ -59,87 +68,163 @@ def _ensure_raw_table(conn: psycopg.Connection) -> None:
             """
         )
         cursor.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_raw_energy_charts_frequency_series_ts
-            ON {_RAW_SCHEMA}.energy_charts_frequency (series_id, event_timestamp)
             """
+            SELECT 1
+            FROM pg_indexes
+            WHERE schemaname = %s
+              AND tablename = 'energy_charts_frequency'
+              AND indexname = 'ux_raw_energy_charts_frequency_series_ts'
+            """,
+            (_RAW_SCHEMA,),
         )
-
-
-def _ensure_feature_table(conn: psycopg.Connection) -> None:
-    with conn.cursor() as cursor:
-        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_FEAST_SCHEMA}")
+        has_unique_index = cursor.fetchone() is not None
+        if not has_unique_index:
+            cursor.execute("SELECT pg_advisory_lock(hashtext(%s))", (f"{_RAW_SCHEMA}.energy_charts_frequency.unique",))
+            try:
+                cursor.execute(
+                    """
+                    SELECT 1
+                    FROM pg_indexes
+                    WHERE schemaname = %s
+                      AND tablename = 'energy_charts_frequency'
+                      AND indexname = 'ux_raw_energy_charts_frequency_series_ts'
+                    """,
+                    (_RAW_SCHEMA,),
+                )
+                if cursor.fetchone() is None:
+                    cursor.execute(
+                        f"""
+                        DELETE FROM {_RAW_SCHEMA}.energy_charts_frequency target
+                        USING (
+                            SELECT ctid
+                            FROM (
+                                SELECT
+                                    ctid,
+                                    ROW_NUMBER() OVER (
+                                        PARTITION BY series_id, event_timestamp
+                                        ORDER BY collected_at DESC, ctid DESC
+                                    ) AS row_num
+                                FROM {_RAW_SCHEMA}.energy_charts_frequency
+                            ) ranked
+                            WHERE ranked.row_num > 1
+                        ) duplicates
+                        WHERE target.ctid = duplicates.ctid
+                        """
+                    )
+                    cursor.execute(
+                        f"""
+                        CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_energy_charts_frequency_series_ts
+                        ON {_RAW_SCHEMA}.energy_charts_frequency (series_id, event_timestamp)
+                        """
+                    )
+            finally:
+                cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (f"{_RAW_SCHEMA}.energy_charts_frequency.unique",))
         cursor.execute(
             f"""
-            CREATE TABLE IF NOT EXISTS {_FEAST_SCHEMA}.grid_frequency_5m (
+            CREATE TABLE IF NOT EXISTS {_RAW_SCHEMA}.energy_charts_ingestion_state (
                 series_id TEXT NOT NULL,
-                event_timestamp TIMESTAMPTZ NOT NULL,
-                frequency_hz DOUBLE PRECISION NULL,
-                source_region TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (series_id, event_timestamp)
+                pipeline_name TEXT NOT NULL,
+                last_ingested_ts TIMESTAMPTZ NULL,
+                backfill_cursor_date DATE NULL,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status TEXT NOT NULL DEFAULT 'idle',
+                PRIMARY KEY (series_id, pipeline_name)
             )
             """
         )
-        cursor.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS ix_grid_frequency_5m_event_timestamp
-            ON {_FEAST_SCHEMA}.grid_frequency_5m (event_timestamp)
-            """
-        )
 
 
-def _parse_iso_ts(value: str) -> datetime.datetime:
-    if value.endswith("Z"):
-        value = value.replace("Z", "+00:00")
-    parsed = datetime.datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
+def _series_id_for_region(region: str) -> str:
+    return f"{region.lower()}::grid_frequency"
 
 
 @dag(
     dag_id="energy-charts-feature-pipeline",
-    description="Collect frequency data, build features, materialize, and trigger model training.",
+    description="Incremental raw frequency ingestion with cursor-based windows.",
     schedule="*/5 * * * *",
     start_date=datetime.datetime(2026, 3, 13),
     catchup=False,
-    tags=["energy-charts"],
+    tags=["energy-charts", "raw"],
 )
 def energy_charts_feature_pipeline() -> None:  # noqa: C901
     @task()
-    def collect_raw_events() -> dict[str, Any]:
-        command = {
+    def prepare_window() -> dict[str, Any]:
+        region = os.environ.get("ENERGY_CHARTS_REGION", "DE-Freiburg")
+        series_id = _series_id_for_region(region)
+        window_end = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(seconds=_SAFETY_LAG_SECONDS)
+
+        with _db_connection() as conn:
+            _ensure_tables(conn)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT last_ingested_ts
+                    FROM {_RAW_SCHEMA}.energy_charts_ingestion_state
+                    WHERE series_id = %s AND pipeline_name = %s
+                    """,
+                    (series_id, _PIPELINE_NAME),
+                )
+                row = cursor.fetchone()
+
+        if row and row[0]:
+            last_ingested_ts = row[0].astimezone(datetime.timezone.utc)
+            window_start = last_ingested_ts - datetime.timedelta(seconds=_OVERLAP_SECONDS)
+        else:
+            window_start = window_end - datetime.timedelta(hours=_INITIAL_LOOKBACK_HOURS)
+
+        if window_start >= window_end:
+            window_start = window_end - datetime.timedelta(minutes=1)
+
+        return {
             "request_id": str(uuid.uuid4()),
-            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
-            "region": os.environ.get("ENERGY_CHARTS_REGION", "DE-Freiburg"),
+            "region": region,
+            "series_id": series_id,
+            "window_start": window_start.isoformat(),
+            "window_end": window_end.isoformat(),
         }
-        payload = collect_frequency_events(command)
-        logger.info("Collected %d raw frequency events", len(payload.get("events", [])))
+
+    @task()
+    def collect_raw_events(window: dict[str, Any]) -> dict[str, Any]:
+        payload = collect_frequency_events_for_range(
+            window_start=_parse_iso_ts(window["window_start"]),
+            window_end=_parse_iso_ts(window["window_end"]),
+            region=window["region"],
+            request_id=window["request_id"],
+        )
+        payload["series_id"] = window["series_id"]
+        logger.info(
+            "Collected %d raw frequency events for %s -> %s",
+            len(payload.get("events", [])),
+            payload["window_start"],
+            payload["window_end"],
+        )
         return payload
 
     @task()
     def write_raw_table(payload: dict[str, Any]) -> dict[str, Any]:
         events = payload.get("events", [])
         if not events:
-            payload["written_raw"] = False
+            payload["rows_written"] = 0
             return payload
 
+        max_event_ts: datetime.datetime | None = None
         with _db_connection() as conn:
-            _ensure_raw_table(conn)
+            _ensure_tables(conn)
             with conn.cursor() as cursor:
-                rows = [
-                    (
+                rows = []
+                for event in events:
+                    event_ts = _parse_iso_ts(event["event_timestamp"])
+                    if max_event_ts is None or event_ts > max_event_ts:
+                        max_event_ts = event_ts
+                    rows.append((
                         event["event_id"],
                         event["series_id"],
-                        _parse_iso_ts(event["event_timestamp"]),
+                        event_ts,
                         event.get("frequency_hz"),
                         event["source_region"],
                         event["request_id"],
                         _parse_iso_ts(event["collected_at"]),
-                    )
-                    for event in events
-                ]
+                    ))
                 cursor.executemany(
                     f"""
                     INSERT INTO {_RAW_SCHEMA}.energy_charts_frequency (
@@ -152,139 +237,77 @@ def energy_charts_feature_pipeline() -> None:  # noqa: C901
                         collected_at
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING
+                    ON CONFLICT (series_id, event_timestamp)
+                    DO UPDATE SET
+                        event_id = EXCLUDED.event_id,
+                        frequency_hz = EXCLUDED.frequency_hz,
+                        source_region = EXCLUDED.source_region,
+                        request_id = EXCLUDED.request_id,
+                        collected_at = EXCLUDED.collected_at
                     """,
                     rows,
                 )
+                payload["rows_written"] = max(cursor.rowcount, 0)
             conn.commit()
 
-        payload["written_raw"] = True
+        payload["max_event_timestamp"] = max_event_ts.isoformat() if max_event_ts else None
         return payload
 
     @task()
-    def aggregate_to_features(payload: dict[str, Any]) -> dict[str, Any]:
-        if not payload.get("written_raw"):
-            payload["affected_feature_rows"] = 0
+    def update_ingestion_state(payload: dict[str, Any]) -> dict[str, Any]:
+        max_event_ts = payload.get("max_event_timestamp")
+        if not max_event_ts:
+            logger.info("No max event timestamp; ingestion cursor remains unchanged.")
             return payload
 
-        window_start = _parse_iso_ts(payload["window_start"])
-        window_end = _parse_iso_ts(payload["window_end"])
-
-        with _db_connection() as conn:
-            _ensure_feature_table(conn)
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    INSERT INTO {_FEAST_SCHEMA}.grid_frequency_5m (
-                        series_id,
-                        event_timestamp,
-                        frequency_hz,
-                        source_region,
-                        created_at
-                    )
-                    SELECT
-                        series_id,
-                        date_trunc('hour', event_timestamp)
-                            + interval '5 min' * floor(extract(minute from event_timestamp) / 5),
-                        AVG(frequency_hz) AS frequency_hz,
-                        MAX(source_region) AS source_region,
-                        NOW() AS created_at
-                    FROM {_RAW_SCHEMA}.energy_charts_frequency
-                    WHERE event_timestamp >= %s
-                      AND event_timestamp < %s
-                    GROUP BY series_id, date_trunc('hour', event_timestamp)
-                             + interval '5 min' * floor(extract(minute from event_timestamp) / 5)
-                    ON CONFLICT (series_id, event_timestamp)
-                    DO UPDATE SET
-                        frequency_hz = EXCLUDED.frequency_hz,
-                        source_region = EXCLUDED.source_region,
-                        created_at = NOW()
-                    WHERE {_FEAST_SCHEMA}.grid_frequency_5m.frequency_hz IS DISTINCT FROM EXCLUDED.frequency_hz
-                       OR {_FEAST_SCHEMA}.grid_frequency_5m.source_region IS DISTINCT FROM EXCLUDED.source_region
-                    """,
-                    (window_start, window_end),
+        with _db_connection() as conn, conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {_RAW_SCHEMA}.energy_charts_ingestion_state (
+                    series_id,
+                    pipeline_name,
+                    last_ingested_ts,
+                    updated_at,
+                    status
                 )
-                affected_rows = cursor.rowcount
+                VALUES (%s, %s, %s, NOW(), %s)
+                ON CONFLICT (series_id, pipeline_name)
+                DO UPDATE SET
+                    last_ingested_ts = GREATEST(
+                        {_RAW_SCHEMA}.energy_charts_ingestion_state.last_ingested_ts,
+                        EXCLUDED.last_ingested_ts
+                    ),
+                    updated_at = NOW(),
+                    status = EXCLUDED.status
+                """,
+                (payload["series_id"], _PIPELINE_NAME, _parse_iso_ts(max_event_ts), "live"),
+            )
             conn.commit()
-
-        payload["affected_feature_rows"] = max(affected_rows, 0)
-        logger.info("Affected %d feature rows", payload["affected_feature_rows"])
         return payload
 
     @task()
-    def publish_feature_view_trigger(payload: dict[str, Any]) -> dict[str, Any]:
-        if payload.get("affected_feature_rows", 0) <= 0:
-            logger.info("Skipping feature-view trigger; no new feature rows.")
-            return payload
-
-        event = {
-            "event_id": str(uuid.uuid4()),
-            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
-            "source": "energy-charts-feature-pipeline",
-            "pipeline": "energy-charts-feature-pipeline",
-            "window_start": payload["window_start"],
-            "window_end": payload["window_end"],
-            "affected_feature_rows": payload["affected_feature_rows"],
-        }
-        publish_event(KafkaTopics.FEATURES_ENERGY_CHARTS_UPDATED.value, event)
-        logger.info(
-            "Published feature update trigger event to %s",
-            KafkaTopics.FEATURES_ENERGY_CHARTS_UPDATED.value,
-        )
-        return payload
-
-    @task()
-    def materialize_features(payload: dict[str, Any]) -> dict[str, Any]:
-        if payload.get("affected_feature_rows", 0) <= 0:
-            payload["materialized"] = False
-            return payload
-
-        if not _ENABLE_MATERIALIZATION:
-            logger.info("Skipping Feast materialization because ENABLE_FEAST_MATERIALIZATION is false.")
-            payload["materialized"] = False
-            return payload
-
-        try:
-            from feast import FeatureStore
-        except ImportError:
-            logger.warning("Skipping Feast materialization because Feast is not installed in Airflow runtime.")
-            payload["materialized"] = False
-            return payload
-
-        window_end = _parse_iso_ts(payload["window_end"])
-        store = FeatureStore(repo_path=_FEAST_REPO_PATH)
-        store.materialize_incremental(end_date=window_end)
-        payload["materialized"] = True
-        return payload
-
-    @task()
-    def publish_training_trigger(payload: dict[str, Any]) -> None:
-        if not payload.get("materialized"):
-            logger.info("Skipping training trigger; no new feature data was materialized.")
+    def publish_raw_update_trigger(payload: dict[str, Any]) -> None:
+        if payload.get("rows_written", 0) <= 0:
+            logger.info("Skipping raw update trigger; no rows written.")
             return
 
-        events = payload.get("events", [])
-        series_id = events[0]["series_id"] if events else None
         event = {
             "event_id": str(uuid.uuid4()),
             "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
-            "source": "energy-charts-feature-pipeline",
-            "pipeline": "energy-charts-feature-pipeline",
+            "source": _PIPELINE_NAME,
+            "pipeline": _PIPELINE_NAME,
+            "series_id": payload["series_id"],
             "window_start": payload["window_start"],
             "window_end": payload["window_end"],
-            "series_id": series_id,
-            "affected_feature_rows": payload.get("affected_feature_rows", 0),
-            "materialized": True,
+            "rows_written": payload["rows_written"],
         }
-        publish_event(KafkaTopics.CMD_MODEL_TRAINING.value, event)
-        logger.info("Published training trigger event to %s", KafkaTopics.CMD_MODEL_TRAINING.value)
+        publish_event(KafkaTopics.RAW_ENERGY_CHARTS_UPDATED.value, event)
 
-    payload = collect_raw_events()
+    window = prepare_window()
+    payload = collect_raw_events(window)
     payload = write_raw_table(payload)
-    payload = aggregate_to_features(payload)
-    payload = publish_feature_view_trigger(payload)
-    payload = materialize_features(payload)
-    publish_training_trigger(payload)
+    payload = update_ingestion_state(payload)
+    publish_raw_update_trigger(payload)
 
 
 energy_charts_feature_pipeline()

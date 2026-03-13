@@ -71,6 +71,9 @@ x-airflow-common:
     # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
     # yamllint enable rule:line-length
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: ${AIRFLOW__CORE__DEFAULT_TIMEZONE:-Europe/Berlin}
+    AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE: ${AIRFLOW__WEBSERVER__DEFAULT_UI_TIMEZONE:-Europe/Berlin}
+    TZ: ${TZ:-Europe/Berlin}
     # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
     # for other purpose (development, test and especially production usage) build/extend Airflow image.
     # uvicorn>=0.29.0 is required for Airflow 3.x api-server (timeout_worker_healthcheck argument)
@@ -108,6 +111,7 @@ services:
     image: apache/kafka:latest
     container_name: kafka-broker
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
@@ -136,6 +140,7 @@ services:
       context: ../..
       dockerfile: services/kafka-bootstrap/Dockerfile
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     depends_on:
       kafka-broker:
@@ -147,6 +152,7 @@ services:
       context: ../..
       dockerfile: services/test-consumer/Dockerfile
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
     depends_on:
       kafka-broker:
@@ -160,20 +166,52 @@ services:
       context: ../..
       dockerfile: services/feature-view-service/Dockerfile
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
-      KAFKA_TOPIC: features.energy_charts.updated
-      KAFKA_CONSUMER_GROUP: feature-view-service
+      KAFKA_TOPIC: raw.energy_charts.updated
+      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-none}
       FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
       FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
       FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
-      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
+      RAW_SCHEMA: ${RAW_SCHEMA:-raw}
       FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
       FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
       FEATURE_VIEW_OUTPUT_DIR: /app/output
       FEATURE_VIEW_LOOKBACK_DAYS: ${FEATURE_VIEW_LOOKBACK_DAYS:-30}
       FEATURE_VIEW_MAX_ROWS: ${FEATURE_VIEW_MAX_ROWS:-20000}
+      FEATURE_VIEW_PROFILE_MAX_ROWS: ${FEATURE_VIEW_PROFILE_MAX_ROWS:-50000}
+      FEATURE_VIEW_DISPLAY_TZ: ${FEATURE_VIEW_DISPLAY_TZ:-Europe/Berlin}
+      KAFKA_MAX_POLL_INTERVAL_MS: ${KAFKA_MAX_POLL_INTERVAL_MS:-1800000}
+      KAFKA_SESSION_TIMEOUT_MS: ${KAFKA_SESSION_TIMEOUT_MS:-30000}
     volumes:
       - ../../artifacts/feature-view:/app/output
+    depends_on:
+      kafka-broker:
+        condition: service_healthy
+      kafka-bootstrap:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  energy-charts-backfill-service:
+    build:
+      context: ../..
+      dockerfile: services/energy-charts-backfill-service/Dockerfile
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
+      KAFKA_TOPIC: cmd.energy_charts.backfill
+      KAFKA_CONSUMER_GROUP: energy-charts-backfill-service
+      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
+      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
+      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
+      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
+      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
+      RAW_SCHEMA: ${RAW_SCHEMA:-raw}
+      ENERGY_CHARTS_REGION: ${ENERGY_CHARTS_REGION:-DE-Freiburg}
+      BACKFILL_MIN_COMPLETE_DAY_ROWS: ${BACKFILL_MIN_COMPLETE_DAY_ROWS:-86400}
+      BACKFILL_CHUNK_DAYS: ${BACKFILL_CHUNK_DAYS:-3}
     depends_on:
       kafka-broker:
         condition: service_healthy
@@ -186,6 +224,8 @@ services:
   postgres:
     image: postgres:16
     environment:
+      TZ: ${TZ:-Europe/Berlin}
+      PGTZ: UTC
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
@@ -204,6 +244,8 @@ services:
     image: redis:7.2-bookworm
     expose:
       - 6379
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
     volumes:
       - redis-data:/data
     healthcheck:
@@ -221,6 +263,7 @@ services:
     command: ["feast", "ui", "--host", "0.0.0.0", "--port", "8888"]
     working_dir: /app/feast/feature_repo
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       FEAST_REGISTRY_DB_URL: ${FEAST_REGISTRY_DB_URL}
       FEAST_REDIS_CONNECTION_STRING: ${FEAST_REDIS_CONNECTION_STRING}
       FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
@@ -249,6 +292,7 @@ services:
     command: ["feast", "serve", "--host", "0.0.0.0", "--port", "6566"]
     working_dir: /app/feast/feature_repo
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       FEAST_REGISTRY_DB_URL: ${FEAST_REGISTRY_DB_URL}
       FEAST_REDIS_CONNECTION_STRING: ${FEAST_REDIS_CONNECTION_STRING}
       FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
@@ -273,6 +317,7 @@ services:
   metabase:
     image: metabase/metabase:v0.56.2
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       MB_DB_FILE: /metabase-data/metabase.db
     ports:
       - "${METABASE_PORT:-3000}:3000"
@@ -286,6 +331,7 @@ services:
   postgres-feast-init:
     image: postgres:16
     environment:
+      TZ: ${TZ:-Europe/Berlin}
       PGPASSWORD: airflow
     entrypoint: ["/bin/bash", "-c"]
     command:

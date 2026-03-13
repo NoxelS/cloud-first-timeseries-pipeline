@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import matplotlib
 import pandas as pd
@@ -26,11 +28,14 @@ def _kafka_bootstrap_servers() -> str:
 
 
 def _topic_name() -> str:
-    return str(os.environ.get("KAFKA_TOPIC", KafkaTopics.FEATURES_ENERGY_CHARTS_UPDATED.value))
+    return str(os.environ.get("KAFKA_TOPIC", KafkaTopics.RAW_ENERGY_CHARTS_UPDATED.value))
 
 
-def _consumer_group() -> str:
-    return os.environ.get("KAFKA_CONSUMER_GROUP", "feature-view-service")
+def _consumer_group() -> str | None:
+    value = os.environ.get("KAFKA_CONSUMER_GROUP", "")
+    if not value or value.lower() == "none":
+        return None
+    return value
 
 
 def _output_dir() -> Path:
@@ -45,6 +50,22 @@ def _max_rows() -> int:
     return int(os.environ.get("FEATURE_VIEW_MAX_ROWS", "20000"))
 
 
+def _max_poll_interval_ms() -> int:
+    return int(os.environ.get("KAFKA_MAX_POLL_INTERVAL_MS", "1800000"))
+
+
+def _session_timeout_ms() -> int:
+    return int(os.environ.get("KAFKA_SESSION_TIMEOUT_MS", "30000"))
+
+
+def _profile_max_rows() -> int:
+    return int(os.environ.get("FEATURE_VIEW_PROFILE_MAX_ROWS", "50000"))
+
+
+def _display_timezone() -> ZoneInfo:
+    return ZoneInfo(os.environ.get("FEATURE_VIEW_DISPLAY_TZ", "Europe/Berlin"))
+
+
 def _db_connection() -> psycopg.Connection:
     return psycopg.connect(
         host=os.environ["FEAST_OFFLINE_STORE_HOST"],
@@ -55,41 +76,51 @@ def _db_connection() -> psycopg.Connection:
     )
 
 
-def _feature_schema() -> str:
-    return os.environ.get("FEAST_OFFLINE_STORE_SCHEMA", "feast")
+def _raw_schema() -> str:
+    return os.environ.get("RAW_SCHEMA", "raw")
 
 
 def load_feature_frame() -> pd.DataFrame:
-    schema = _feature_schema()
+    schema = _raw_schema()
     query = f"""
-        SELECT series_id, event_timestamp, frequency_hz, source_region, created_at
-        FROM {schema}.grid_frequency_5m
-        WHERE event_timestamp >= NOW() - (%s * interval '1 day')
-        ORDER BY event_timestamp DESC
-        LIMIT %s
+        SELECT series_id, event_timestamp, frequency_hz, source_region, collected_at
+        FROM {schema}.energy_charts_frequency
+        ORDER BY event_timestamp ASC
     """
 
-    with _db_connection() as conn, conn.cursor() as cursor:
-        cursor.execute(query, (_lookback_days(), _max_rows()))
-        rows = cursor.fetchall()
+    rows: list[tuple[Any, ...]] = []
+    with _db_connection() as conn, conn.cursor(name="feature_view_raw_cursor") as cursor:
+        cursor.itersize = 100000
+        cursor.execute(query)
         columns = [column.name for column in cursor.description or []]
+        loaded = 0
+        while True:
+            chunk = cursor.fetchmany(100000)
+            if not chunk:
+                break
+            rows.extend(chunk)
+            loaded += len(chunk)
+            if loaded % 500000 == 0:
+                logger.info("Loaded %d rows for plotting", loaded)
 
     frame = pd.DataFrame(rows, columns=columns)
     if frame.empty:
         return frame
 
     frame["event_timestamp"] = pd.to_datetime(frame["event_timestamp"], utc=True)
-    frame["created_at"] = pd.to_datetime(frame["created_at"], utc=True)
+    frame["collected_at"] = pd.to_datetime(frame["collected_at"], utc=True)
     frame = frame.sort_values("event_timestamp")
     return frame
 
 
 def _plot_timeseries(frame: pd.DataFrame, output_dir: Path) -> None:
     path = output_dir / "grid_frequency_timeseries.png"
+    frame_local = frame.copy()
+    frame_local["event_timestamp_local"] = frame_local["event_timestamp"].dt.tz_convert(_display_timezone())
     plt.figure(figsize=(14, 5))
-    plt.plot(frame["event_timestamp"], frame["frequency_hz"], linewidth=1.0, color="#1f77b4")
-    plt.title("Grid Frequency (5-Minute Aggregation)")
-    plt.xlabel("Timestamp (UTC)")
+    plt.plot(frame_local["event_timestamp_local"], frame_local["frequency_hz"], linewidth=1.0, color="#1f77b4")
+    plt.title("Grid Frequency (Per-Second Raw)")
+    plt.xlabel(f"Timestamp ({_display_timezone().key})")
     plt.ylabel("Frequency (Hz)")
     plt.grid(alpha=0.3)
     plt.tight_layout()
@@ -110,11 +141,20 @@ def _plot_distribution(frame: pd.DataFrame, output_dir: Path) -> None:
 
 
 def _write_profile(frame: pd.DataFrame, output_dir: Path) -> None:
+    profile_frame = frame.copy()
+    profile_frame["event_timestamp_local"] = profile_frame["event_timestamp"].dt.tz_convert(_display_timezone())
+    profile_frame["collected_at_local"] = profile_frame["collected_at"].dt.tz_convert(_display_timezone())
+    max_rows = _profile_max_rows()
+    if len(profile_frame) > max_rows:
+        profile_frame = profile_frame.tail(max_rows)
+        logger.info("Profiling sampled frame with %d/%d rows", len(profile_frame), len(frame))
+
     report_path = output_dir / "feature_profile_report.html"
     profile = ProfileReport(
-        frame,
+        profile_frame,
         title="Grid Frequency Feature Profile",
         minimal=True,
+        progress_bar=False,
     )
     profile.to_file(report_path)
 
@@ -122,7 +162,7 @@ def _write_profile(frame: pd.DataFrame, output_dir: Path) -> None:
 def _write_empty_notice(output_dir: Path) -> None:
     notice_path = output_dir / "README.txt"
     notice_path.write_text(
-        "No rows available in feast.grid_frequency_5m for configured lookback window.\n",
+        "No rows available in raw.energy_charts_frequency for configured lookback window.\n",
         encoding="utf-8",
     )
 
@@ -134,47 +174,65 @@ def generate_artifacts(trigger_event: dict[str, Any]) -> None:
     trigger_path = out_dir / "last_trigger_event.json"
     trigger_path.write_text(json.dumps(trigger_event, indent=2), encoding="utf-8")
 
+    logger.info("Loading raw frequency frame from database")
     frame = load_feature_frame()
     if frame.empty:
         logger.warning("No feature rows available for reporting.")
         _write_empty_notice(out_dir)
         return
 
+    logger.info("Generating plots from %d rows", len(frame))
     _plot_timeseries(frame, out_dir)
     _plot_distribution(frame, out_dir)
+    logger.info("Generating profiling report")
     _write_profile(frame, out_dir)
     logger.info("Generated feature-view artifacts at %s", out_dir)
 
 
 def run() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    topic = _topic_name()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+    while True:
+        topic = _topic_name()
+        group_id = _consumer_group()
+        consumer = KafkaConsumer(
+            topic,
+            bootstrap_servers=_kafka_bootstrap_servers(),
+            auto_offset_reset="latest",
+            enable_auto_commit=bool(group_id),
+            group_id=group_id,
+            max_poll_records=1,
+            max_poll_interval_ms=_max_poll_interval_ms(),
+            session_timeout_ms=_session_timeout_ms(),
+            value_deserializer=lambda value: json.loads(value.decode("utf-8")),
+        )
 
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=_kafka_bootstrap_servers(),
-        auto_offset_reset="latest",
-        enable_auto_commit=True,
-        group_id=_consumer_group(),
-        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-    )
+        logger.info("Feature-view service listening on topic '%s'", topic)
+        try:
+            while True:
+                messages = consumer.poll(timeout_ms=1000, max_records=1)
+                if not messages:
+                    continue
 
-    logger.info("Feature-view service listening on topic '%s'", topic)
-    try:
-        for message in consumer:
-            payload = message.value if isinstance(message.value, dict) else {}
-            logger.info(
-                "Received trigger topic=%s partition=%s offset=%s",
-                message.topic,
-                message.partition,
-                message.offset,
-            )
-            try:
-                generate_artifacts(payload)
-            except Exception:
-                logger.exception("Failed to generate feature-view artifacts")
-    finally:
-        consumer.close()
+                for _, records in messages.items():
+                    for message in records:
+                        payload = message.value if isinstance(message.value, dict) else {}
+                        logger.info(
+                            "Received trigger topic=%s partition=%s offset=%s",
+                            message.topic,
+                            message.partition,
+                            message.offset,
+                        )
+                        try:
+                            generate_artifacts(payload)
+                            if group_id:
+                                consumer.commit()
+                        except BaseException:
+                            logger.exception("Failed to generate feature-view artifacts")
+        except BaseException:
+            logger.exception("Feature-view consumer loop crashed, retrying in 5 seconds")
+            time.sleep(5)
+        finally:
+            consumer.close()
 
 
 if __name__ == "__main__":

@@ -5,12 +5,15 @@ KAFKA_BOOTSTRAP := localhost:9092
 KAFKA_BIN := /opt/kafka/bin
 TOPIC ?=
 GROUP ?=
+START_DATE ?=
+END_DATE ?=2023-01-01
+REGION ?=DE-Freiburg
 
 .PHONY: help deploy hard-deploy bootstrap down hard-down \
 	compose-validate compose-config compose-ps compose-logs compose-restart \
 	feast-up feast-server-up feast-down feast-plan feast-apply feast-list \
 	sync lint format format-check type-check test test-cov security audit ci validate \
-	kafka-topics kafka-topic-describe kafka-topic-create kafka-consumer-groups kafka-consumer-lag kafka-consumer-group-describe kafka-consumer-group-delete
+	kafka-topics kafka-topic-describe kafka-topic-create kafka-consumer-groups kafka-consumer-lag kafka-consumer-group-describe kafka-consumer-group-delete backfill-trigger volumes-size
 
 help:
 	@echo "Common targets:"
@@ -28,6 +31,8 @@ help:
 	@echo "  kafka-topic-create TOPIC=<name>   - Create topic (3 partitions, RF=1)"
 	@echo "  kafka-consumer-group-describe GROUP=<name> - Describe one consumer group"
 	@echo "  kafka-consumer-group-delete GROUP=<name>   - Delete one consumer group"
+	@echo "  backfill-trigger [START_DATE=YYYY-MM-DD] [END_DATE=YYYY-MM-DD] [REGION=DE-Freiburg] - Trigger Energy Charts backfill"
+	@echo "  volumes-size                     - Print disk usage of project docker volumes"
 
 deploy:
 	$(COMPOSE) down
@@ -141,3 +146,16 @@ kafka-consumer-group-delete:
 
 openapi-generator-open-charts:
 	uvx run openapi-python-client generate --url https://api.energy-charts.info/openapi.json --output-path adapters/energy-charts-collector
+
+backfill-trigger:
+	KAFKA_BOOTSTRAP_SERVERS=localhost:9092 uv run python scripts/trigger_energy_charts_backfill.py $(if $(START_DATE),--start-date $(START_DATE),) --end-date $(END_DATE) --region $(REGION)
+
+volumes-size:
+	@vols=$$(docker volume ls -q --filter label=com.docker.compose.project=forecasting); \
+	if [ -z "$$vols" ]; then \
+		echo "No docker volumes found for project 'forecasting'."; \
+		exit 0; \
+	fi; \
+	vols_csv=$$(printf "%s\n" $$vols | tr "\n" ","); \
+	export VOLS_CSV="$$vols_csv"; \
+	docker system df -v --format '{{json .}}' | uv run python -c "import json,os,re,sys; wanted={v for v in os.environ.get('VOLS_CSV','').split(',') if v}; data=json.load(sys.stdin); vols=data.get('Volumes',[]); units={'B':1,'kB':1000,'MB':1000**2,'GB':1000**3,'TB':1000**4}; to_bytes=lambda s:(lambda m:int(float(m.group(1))*units.get(m.group(2),1)) if m else 0)(re.match(r'^([0-9]+(?:\\.[0-9]+)?)([A-Za-z]+)$$', str(s))); rows=sorted([v for v in vols if v.get('Name') in wanted], key=lambda x: x.get('Name','')); total=sum(to_bytes(v.get('Size','0B')) for v in rows); print('Volume\\tSize\\tLinks'); [print(f\"{v.get('Name')}\\t{v.get('Size','0B')}\\t{v.get('Links','?')}\") for v in rows]; print(f\"TOTAL_BYTES\\t{total}\\t-\")"
