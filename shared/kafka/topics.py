@@ -15,3 +15,4 @@ class KafkaTopics(str, Enum):
     CMD_MODEL_TRAINING = "cmd.model_training"
     RAW_ENERGY_CHARTS = "raw.energy_charts"
     FEATURES_ENERGY_CHARTS = "features.energy_charts"
+    FEATURES_ENERGY_CHARTS_UPDATED = "features.energy_charts.updated"

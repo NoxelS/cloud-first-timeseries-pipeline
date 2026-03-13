@@ -212,6 +212,28 @@ def energy_charts_feature_pipeline() -> None:  # noqa: C901
         return payload
 
     @task()
+    def publish_feature_view_trigger(payload: dict[str, Any]) -> dict[str, Any]:
+        if payload.get("affected_feature_rows", 0) <= 0:
+            logger.info("Skipping feature-view trigger; no new feature rows.")
+            return payload
+
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+            "source": "energy-charts-feature-pipeline",
+            "pipeline": "energy-charts-feature-pipeline",
+            "window_start": payload["window_start"],
+            "window_end": payload["window_end"],
+            "affected_feature_rows": payload["affected_feature_rows"],
+        }
+        publish_event(KafkaTopics.FEATURES_ENERGY_CHARTS_UPDATED.value, event)
+        logger.info(
+            "Published feature update trigger event to %s",
+            KafkaTopics.FEATURES_ENERGY_CHARTS_UPDATED.value,
+        )
+        return payload
+
+    @task()
     def materialize_features(payload: dict[str, Any]) -> dict[str, Any]:
         if payload.get("affected_feature_rows", 0) <= 0:
             payload["materialized"] = False
@@ -260,6 +282,7 @@ def energy_charts_feature_pipeline() -> None:  # noqa: C901
     payload = collect_raw_events()
     payload = write_raw_table(payload)
     payload = aggregate_to_features(payload)
+    payload = publish_feature_view_trigger(payload)
     payload = materialize_features(payload)
     publish_training_trigger(payload)
 
