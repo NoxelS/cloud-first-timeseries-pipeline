@@ -18,6 +18,7 @@ from shared.kafka.topics import KafkaTopics
 logger = logging.getLogger(__name__)
 
 _RAW_SCHEMA = os.environ.get("RAW_SCHEMA", "raw")
+_FEAST_SCHEMA = os.environ.get("FEAST_OFFLINE_STORE_SCHEMA", "feast")
 _PIPELINE_NAME = "energy-charts-backfill-service"
 _MIN_COMPLETE_DAY_ROWS = int(os.environ.get("BACKFILL_MIN_COMPLETE_DAY_ROWS", "86400"))
 _BACKFILL_CHUNK_DAYS = int(os.environ.get("BACKFILL_CHUNK_DAYS", "3"))
@@ -121,6 +122,64 @@ def _ensure_tables(conn: psycopg.Connection) -> None:
             )
             """
         )
+        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_FEAST_SCHEMA}")
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_FEAST_SCHEMA}.grid_frequency_5m (
+                series_id TEXT NOT NULL,
+                event_timestamp TIMESTAMPTZ NOT NULL,
+                source_region TEXT NULL,
+                frequency_mean_hz DOUBLE PRECISION NULL,
+                frequency_min_hz DOUBLE PRECISION NULL,
+                frequency_max_hz DOUBLE PRECISION NULL,
+                frequency_stddev_hz DOUBLE PRECISION NULL,
+                sample_count BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (series_id, event_timestamp)
+            )
+            """
+        )
+        cursor.execute(
+            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ADD COLUMN IF NOT EXISTS source_region TEXT"
+        )
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_FEAST_SCHEMA}.grid_frequency_15m (
+                series_id TEXT NOT NULL,
+                event_timestamp TIMESTAMPTZ NOT NULL,
+                source_region TEXT NULL,
+                frequency_mean_hz DOUBLE PRECISION NULL,
+                frequency_min_hz DOUBLE PRECISION NULL,
+                frequency_max_hz DOUBLE PRECISION NULL,
+                frequency_stddev_hz DOUBLE PRECISION NULL,
+                sample_count BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (series_id, event_timestamp)
+            )
+            """
+        )
+        cursor.execute(
+            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ADD COLUMN IF NOT EXISTS source_region TEXT"
+        )
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {_FEAST_SCHEMA}.grid_frequency_1h (
+                series_id TEXT NOT NULL,
+                event_timestamp TIMESTAMPTZ NOT NULL,
+                source_region TEXT NULL,
+                frequency_mean_hz DOUBLE PRECISION NULL,
+                frequency_min_hz DOUBLE PRECISION NULL,
+                frequency_max_hz DOUBLE PRECISION NULL,
+                frequency_stddev_hz DOUBLE PRECISION NULL,
+                sample_count BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (series_id, event_timestamp)
+            )
+            """
+        )
+        cursor.execute(
+            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ADD COLUMN IF NOT EXISTS source_region TEXT"
+        )
 
 
 def _parse_date(value: str) -> datetime.date:
@@ -186,6 +245,131 @@ def _upsert_rows(events: list[dict[str, Any]]) -> tuple[int, datetime.datetime |
             written = max(cursor.rowcount, 0)
         conn.commit()
     return written, max_event_ts
+
+
+def _upsert_aggregates(conn: psycopg.Connection, start_ts: datetime.datetime, end_ts: datetime.datetime) -> int:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            f"""
+            INSERT INTO {_FEAST_SCHEMA}.grid_frequency_5m (
+                series_id,
+                event_timestamp,
+                source_region,
+                frequency_mean_hz,
+                frequency_min_hz,
+                frequency_max_hz,
+                frequency_stddev_hz,
+                sample_count,
+                created_at
+            )
+            SELECT
+                series_id,
+                date_bin(interval '5 minutes', event_timestamp, '1970-01-01'::timestamptz),
+                MAX(source_region),
+                AVG(frequency_hz),
+                MIN(frequency_hz),
+                MAX(frequency_hz),
+                STDDEV_SAMP(frequency_hz),
+                COUNT(frequency_hz),
+                NOW()
+            FROM {_RAW_SCHEMA}.energy_charts_frequency
+            WHERE event_timestamp >= %s
+              AND event_timestamp < %s
+            GROUP BY series_id, date_bin(interval '5 minutes', event_timestamp, '1970-01-01'::timestamptz)
+            ON CONFLICT (series_id, event_timestamp)
+            DO UPDATE SET
+                frequency_mean_hz = EXCLUDED.frequency_mean_hz,
+                source_region = EXCLUDED.source_region,
+                frequency_min_hz = EXCLUDED.frequency_min_hz,
+                frequency_max_hz = EXCLUDED.frequency_max_hz,
+                frequency_stddev_hz = EXCLUDED.frequency_stddev_hz,
+                sample_count = EXCLUDED.sample_count,
+                created_at = NOW()
+            """,
+            (start_ts, end_ts),
+        )
+        affected_5m = max(cursor.rowcount, 0)
+        cursor.execute(
+            f"""
+            INSERT INTO {_FEAST_SCHEMA}.grid_frequency_15m (
+                series_id,
+                event_timestamp,
+                source_region,
+                frequency_mean_hz,
+                frequency_min_hz,
+                frequency_max_hz,
+                frequency_stddev_hz,
+                sample_count,
+                created_at
+            )
+            SELECT
+                series_id,
+                date_bin(interval '15 minutes', event_timestamp, '1970-01-01'::timestamptz),
+                MAX(source_region),
+                AVG(frequency_hz),
+                MIN(frequency_hz),
+                MAX(frequency_hz),
+                STDDEV_SAMP(frequency_hz),
+                COUNT(frequency_hz),
+                NOW()
+            FROM {_RAW_SCHEMA}.energy_charts_frequency
+            WHERE event_timestamp >= %s
+              AND event_timestamp < %s
+            GROUP BY series_id, date_bin(interval '15 minutes', event_timestamp, '1970-01-01'::timestamptz)
+            ON CONFLICT (series_id, event_timestamp)
+            DO UPDATE SET
+                frequency_mean_hz = EXCLUDED.frequency_mean_hz,
+                source_region = EXCLUDED.source_region,
+                frequency_min_hz = EXCLUDED.frequency_min_hz,
+                frequency_max_hz = EXCLUDED.frequency_max_hz,
+                frequency_stddev_hz = EXCLUDED.frequency_stddev_hz,
+                sample_count = EXCLUDED.sample_count,
+                created_at = NOW()
+            """,
+            (start_ts, end_ts),
+        )
+        affected_15m = max(cursor.rowcount, 0)
+        cursor.execute(
+            f"""
+            INSERT INTO {_FEAST_SCHEMA}.grid_frequency_1h (
+                series_id,
+                event_timestamp,
+                source_region,
+                frequency_mean_hz,
+                frequency_min_hz,
+                frequency_max_hz,
+                frequency_stddev_hz,
+                sample_count,
+                created_at
+            )
+            SELECT
+                series_id,
+                date_bin(interval '1 hour', event_timestamp, '1970-01-01'::timestamptz),
+                MAX(source_region),
+                AVG(frequency_hz),
+                MIN(frequency_hz),
+                MAX(frequency_hz),
+                STDDEV_SAMP(frequency_hz),
+                COUNT(frequency_hz),
+                NOW()
+            FROM {_RAW_SCHEMA}.energy_charts_frequency
+            WHERE event_timestamp >= %s
+              AND event_timestamp < %s
+            GROUP BY series_id, date_bin(interval '1 hour', event_timestamp, '1970-01-01'::timestamptz)
+            ON CONFLICT (series_id, event_timestamp)
+            DO UPDATE SET
+                frequency_mean_hz = EXCLUDED.frequency_mean_hz,
+                source_region = EXCLUDED.source_region,
+                frequency_min_hz = EXCLUDED.frequency_min_hz,
+                frequency_max_hz = EXCLUDED.frequency_max_hz,
+                frequency_stddev_hz = EXCLUDED.frequency_stddev_hz,
+                sample_count = EXCLUDED.sample_count,
+                created_at = NOW()
+            """,
+            (start_ts, end_ts),
+        )
+        affected_1h = max(cursor.rowcount, 0)
+    return affected_5m + affected_15m + affected_1h
 
 
 def _day_row_count(series_id: str, day: datetime.date) -> int:
@@ -324,6 +508,7 @@ def run_backfill(payload: dict[str, Any]) -> None:
                 _MIN_COMPLETE_DAY_ROWS,
             )
             written = 0
+            feature_rows = 0
             max_event_ts = chunk_end - datetime.timedelta(seconds=1)
         else:
             logger.info(
@@ -340,6 +525,10 @@ def run_backfill(payload: dict[str, Any]) -> None:
                 request_id=request_id,
             )
             written, max_event_ts = _upsert_rows(range_payload.get("events", []))
+            with _db_connection() as conn:
+                _ensure_tables(conn)
+                feature_rows = _upsert_aggregates(conn, start_ts=chunk_start, end_ts=chunk_end)
+                conn.commit()
 
         next_cursor = chunk_start_day - datetime.timedelta(days=1)
         _update_state(series_id=series_id, last_ingested_ts=max_event_ts, cursor_date=next_cursor)
@@ -350,10 +539,11 @@ def run_backfill(payload: dict[str, Any]) -> None:
             rows_written=written,
         )
         logger.info(
-            "Processed chunk %s -> %s with %d rows written",
+            "Processed chunk %s -> %s with raw_rows=%d feature_rows=%d",
             chunk_start_day.isoformat(),
             chunk_end_day.isoformat(),
             written,
+            feature_rows,
         )
         cursor = next_cursor
 

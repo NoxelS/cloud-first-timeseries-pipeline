@@ -76,15 +76,28 @@ def _db_connection() -> psycopg.Connection:
     )
 
 
-def _raw_schema() -> str:
-    return os.environ.get("RAW_SCHEMA", "raw")
+def _feast_schema() -> str:
+    return os.environ.get("FEAST_OFFLINE_STORE_SCHEMA", "feast")
 
 
-def load_feature_frame() -> pd.DataFrame:
-    schema = _raw_schema()
+def load_feature_frame(resolution: str) -> pd.DataFrame:
+    schema = _feast_schema()
+    table_name = {
+        "5m": "grid_frequency_5m",
+        "15m": "grid_frequency_15m",
+        "1h": "grid_frequency_1h",
+    }[resolution]
     query = f"""
-        SELECT series_id, event_timestamp, frequency_hz, source_region, collected_at
-        FROM {schema}.energy_charts_frequency
+        SELECT
+            series_id,
+            event_timestamp,
+            frequency_mean_hz,
+            frequency_min_hz,
+            frequency_max_hz,
+            frequency_stddev_hz,
+            sample_count,
+            created_at
+        FROM {schema}.{table_name}
         ORDER BY event_timestamp ASC
     """
 
@@ -108,30 +121,32 @@ def load_feature_frame() -> pd.DataFrame:
         return frame
 
     frame["event_timestamp"] = pd.to_datetime(frame["event_timestamp"], utc=True)
-    frame["collected_at"] = pd.to_datetime(frame["collected_at"], utc=True)
+    frame["created_at"] = pd.to_datetime(frame["created_at"], utc=True)
     frame = frame.sort_values("event_timestamp")
+    frame["resolution"] = resolution
     return frame
 
 
-def _plot_timeseries(frame: pd.DataFrame, output_dir: Path) -> None:
+def _plot_timeseries(frames: dict[str, pd.DataFrame], output_dir: Path) -> None:
     path = output_dir / "grid_frequency_timeseries.png"
-    frame_local = frame.copy()
-    frame_local["event_timestamp_local"] = frame_local["event_timestamp"].dt.tz_convert(_display_timezone())
-    plt.figure(figsize=(14, 5))
-    plt.plot(frame_local["event_timestamp_local"], frame_local["frequency_hz"], linewidth=1.0, color="#1f77b4")
-    plt.title("Grid Frequency (Per-Second Raw)")
-    plt.xlabel(f"Timestamp ({_display_timezone().key})")
-    plt.ylabel("Frequency (Hz)")
-    plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150)
-    plt.close()
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=False)
+    for axis, resolution in zip(axes, ["5m", "15m", "1h"], strict=True):
+        frame = frames[resolution]
+        local_ts = frame["event_timestamp"].dt.tz_convert(_display_timezone())
+        axis.plot(local_ts, frame["frequency_mean_hz"], linewidth=1.0, color="#1f77b4")
+        axis.set_title(f"Grid Frequency Mean ({resolution})")
+        axis.set_xlabel(f"Timestamp ({_display_timezone().key})")
+        axis.set_ylabel("Frequency (Hz)")
+        axis.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
 
 
 def _plot_distribution(frame: pd.DataFrame, output_dir: Path) -> None:
     path = output_dir / "grid_frequency_distribution.png"
     plt.figure(figsize=(10, 5))
-    frame["frequency_hz"].dropna().hist(bins=60, color="#ff7f0e", alpha=0.8)
+    frame["frequency_mean_hz"].dropna().hist(bins=60, color="#ff7f0e", alpha=0.8)
     plt.title("Grid Frequency Distribution")
     plt.xlabel("Frequency (Hz)")
     plt.ylabel("Count")
@@ -140,10 +155,41 @@ def _plot_distribution(frame: pd.DataFrame, output_dir: Path) -> None:
     plt.close()
 
 
+def _plot_intraday(frames: dict[str, pd.DataFrame], output_dir: Path) -> None:
+    path = output_dir / "grid_frequency_intraday.png"
+    tz = _display_timezone()
+    local_today = pd.Timestamp.now(tz=tz).date()
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=False)
+    for axis, resolution in zip(axes, ["5m", "15m", "1h"], strict=True):
+        frame = frames[resolution]
+        local_ts = frame["event_timestamp"].dt.tz_convert(tz)
+        intraday_mask = local_ts.dt.date == local_today
+        intraday_frame = frame.loc[intraday_mask].copy()
+        if intraday_frame.empty:
+            axis.text(0.5, 0.5, "No data for local day", ha="center", va="center", transform=axis.transAxes)
+            axis.set_title(f"Intraday Grid Frequency ({resolution})")
+            axis.set_xlabel(f"Time ({tz.key})")
+            axis.set_ylabel("Frequency (Hz)")
+            axis.grid(alpha=0.3)
+            continue
+
+        intraday_local_ts = intraday_frame["event_timestamp"].dt.tz_convert(tz)
+        axis.plot(intraday_local_ts, intraday_frame["frequency_mean_hz"], linewidth=1.2, color="#2a9d8f")
+        axis.set_title(f"Intraday Grid Frequency ({resolution}) - {local_today.isoformat()}")
+        axis.set_xlabel(f"Time ({tz.key})")
+        axis.set_ylabel("Frequency (Hz)")
+        axis.grid(alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def _write_profile(frame: pd.DataFrame, output_dir: Path) -> None:
     profile_frame = frame.copy()
     profile_frame["event_timestamp_local"] = profile_frame["event_timestamp"].dt.tz_convert(_display_timezone())
-    profile_frame["collected_at_local"] = profile_frame["collected_at"].dt.tz_convert(_display_timezone())
+    profile_frame["created_at_local"] = profile_frame["created_at"].dt.tz_convert(_display_timezone())
     max_rows = _profile_max_rows()
     if len(profile_frame) > max_rows:
         profile_frame = profile_frame.tail(max_rows)
@@ -162,7 +208,7 @@ def _write_profile(frame: pd.DataFrame, output_dir: Path) -> None:
 def _write_empty_notice(output_dir: Path) -> None:
     notice_path = output_dir / "README.txt"
     notice_path.write_text(
-        "No rows available in raw.energy_charts_frequency for configured lookback window.\n",
+        "No rows available in feast.grid_frequency_[5m|15m|1h] for plotting.\n",
         encoding="utf-8",
     )
 
@@ -174,18 +220,29 @@ def generate_artifacts(trigger_event: dict[str, Any]) -> None:
     trigger_path = out_dir / "last_trigger_event.json"
     trigger_path.write_text(json.dumps(trigger_event, indent=2), encoding="utf-8")
 
-    logger.info("Loading raw frequency frame from database")
-    frame = load_feature_frame()
-    if frame.empty:
-        logger.warning("No feature rows available for reporting.")
+    logger.info("Loading Feast feature frames from database")
+    frames = {
+        "5m": load_feature_frame("5m"),
+        "15m": load_feature_frame("15m"),
+        "1h": load_feature_frame("1h"),
+    }
+    if any(frame.empty for frame in frames.values()):
+        logger.warning("One or more Feast feature tables are empty; skipping artifacts.")
         _write_empty_notice(out_dir)
         return
 
-    logger.info("Generating plots from %d rows", len(frame))
-    _plot_timeseries(frame, out_dir)
-    _plot_distribution(frame, out_dir)
+    profile_frame = pd.concat([frames["5m"], frames["15m"], frames["1h"]], ignore_index=True)
+    logger.info(
+        "Generating plots from rows: 5m=%d 15m=%d 1h=%d",
+        len(frames["5m"]),
+        len(frames["15m"]),
+        len(frames["1h"]),
+    )
+    _plot_timeseries(frames, out_dir)
+    _plot_intraday(frames, out_dir)
+    _plot_distribution(frames["5m"], out_dir)
     logger.info("Generating profiling report")
-    _write_profile(frame, out_dir)
+    _write_profile(profile_frame, out_dir)
     logger.info("Generated feature-view artifacts at %s", out_dir)
 
 
