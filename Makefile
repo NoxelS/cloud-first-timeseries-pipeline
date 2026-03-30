@@ -5,16 +5,13 @@ KAFKA_BOOTSTRAP := localhost:9092
 KAFKA_BIN := /opt/kafka/bin
 TOPIC ?=
 GROUP ?=
-START_DATE ?=
-END_DATE ?=2023-01-01
-REGION ?=DE-Freiburg
 
 .DEFAULT_GOAL := help
 
 .PHONY: help deploy hard-deploy bootstrap down hard-down \
 	compose-validate compose-config compose-ps compose-logs compose-restart \
 	sync lint lint-fix format format-check type-check test test-unit test-integration test-cov security audit ci validate check \
-	kafka-topics kafka-topic-describe kafka-topic-create kafka-consumer-groups kafka-consumer-lag kafka-consumer-group-describe kafka-consumer-group-delete backfill-trigger volumes-size
+	kafka-topics kafka-topic-describe kafka-topic-create kafka-consumer-groups kafka-consumer-lag kafka-consumer-group-describe kafka-consumer-group-delete volumes-size
 
 help:
 	@echo "Common targets:"
@@ -33,7 +30,6 @@ help:
 	@echo "  kafka-topic-create TOPIC=<name>   - Create topic (3 partitions, RF=1)"
 	@echo "  kafka-consumer-group-describe GROUP=<name> - Describe one consumer group"
 	@echo "  kafka-consumer-group-delete GROUP=<name>   - Delete one consumer group"
-	@echo "  backfill-trigger [START_DATE=YYYY-MM-DD] [END_DATE=YYYY-MM-DD] [REGION=DE-Freiburg] - Trigger Energy Charts backfill"
 	@echo "  volumes-size                     - Print disk usage of project docker volumes"
 
 deploy:
@@ -138,12 +134,6 @@ kafka-consumer-group-describe:
 kafka-consumer-group-delete:
 	@if [ -z "$(GROUP)" ]; then echo "Usage: make kafka-consumer-group-delete GROUP=<group_name>"; exit 1; fi
 	$(COMPOSE) exec -T $(KAFKA_SERVICE) bash -lc '$(KAFKA_BIN)/kafka-consumer-groups.sh --bootstrap-server $(KAFKA_BOOTSTRAP) --delete --group "$(GROUP)"'
-
-openapi-generator-open-charts:
-	uvx run openapi-python-client generate --url https://api.energy-charts.info/openapi.json --output-path adapters/energy-charts-collector
-
-backfill-trigger:
-	KAFKA_BOOTSTRAP_SERVERS=localhost:9092 uv run python scripts/trigger_energy_charts_backfill.py $(if $(START_DATE),--start-date $(START_DATE),) --end-date $(END_DATE) --region $(REGION)
 
 volumes-size:
 	@vols=$$(docker volume ls -q --filter label=com.docker.compose.project=forecasting); \

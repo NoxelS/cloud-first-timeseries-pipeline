@@ -19,7 +19,6 @@ package = false
 members = [
     "shared",
     "services/db-migrations",
-    "services/energy-charts-backfill-service",
     "services/kafka-bootstrap",
     "services/test-consumer",
 ]

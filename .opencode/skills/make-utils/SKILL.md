@@ -8,8 +8,7 @@ compatibility: opencode
 Provides the Makefile targets that trigger specific internal workflows, client generation, or manual scripts.
 
 ## When to use me
-Use this when you need to trigger data backfills or re-generate API clients.
+Use this when you need to run ad hoc utility targets from the Makefile.
 
 ## Available Commands
-- `make backfill-trigger [START_DATE=YYYY-MM-DD] [END_DATE=YYYY-MM-DD] [REGION=DE-Freiburg]` - Triggers Energy Charts backfill via python script.
-- `make openapi-generator-open-charts` - Generates OpenAPI clients using `openapi-python-client`.
+No utility targets are currently defined.
