@@ -36,12 +36,14 @@ def test_kafka_settings_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_heartbeat_settings_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEARTBEAT_INTERVAL_MINUTES", "10")
     monkeypatch.setenv("HEARTBEAT_INCLUDE_INTERNAL_TOPICS", "true")
+    monkeypatch.setenv("HEARTBEAT_LAG_GROUP_ID", "heartbeat-monitor")
     load_heartbeat_settings.cache_clear()
 
     settings = load_heartbeat_settings()
 
     assert settings.interval_minutes == 10
     assert settings.include_internal_topics is True
+    assert settings.lag_group_id == "heartbeat-monitor"
 
 
 def test_heartbeat_cron_defaults_to_15_minutes(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,4 +1,4 @@
-"""Plot Kafka topic offsets from heartbeat history."""
+"""Plot Kafka topic lag from heartbeat history."""
 
 from __future__ import annotations
 
@@ -38,16 +38,16 @@ def _normalize_timestamp(value: datetime.datetime) -> datetime.datetime:
     return value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
 
 
-def _sum_partition_ends(offsets: dict[str, Any]) -> int | None:
+def _sum_partition_lags(offsets: dict[str, Any]) -> int | None:
     total = 0
     has_value = False
     for partition_info in offsets.values():
         if not isinstance(partition_info, dict):
             continue
-        end_offset = partition_info.get("end")
-        if end_offset is None:
+        lag = partition_info.get("lag")
+        if lag is None:
             continue
-        total += int(end_offset)
+        total += int(lag)
         has_value = True
     return total if has_value else None
 
@@ -76,7 +76,7 @@ def _build_series(
                 continue
             if topic not in topic_series:
                 topic_series[topic] = [None] * len(timestamps)
-            topic_series[topic][-1] = _sum_partition_ends(partitions)
+            topic_series[topic][-1] = _sum_partition_lags(partitions)
 
     return timestamps, topic_series
 
@@ -98,9 +98,9 @@ def plot_offsets(output_path: Path) -> None:
     for topic, values in sorted(topic_series.items()):
         ax.plot(timestamps, values, label=topic)
 
-    ax.set_title("Kafka topic end offsets from heartbeat history")
+    ax.set_title("Kafka topic lag from heartbeat history")
     ax.set_xlabel("Heartbeat time (UTC)")
-    ax.set_ylabel("End offset sum")
+    ax.set_ylabel("Lag (messages)")
     ax.grid(True, alpha=0.3)
     ax.xaxis.set_major_formatter(DateFormatter("%Y-%m-%d %H:%M"))
     fig.autofmt_xdate()
@@ -113,7 +113,7 @@ def plot_offsets(output_path: Path) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot Kafka offsets from heartbeat events.")
+    parser = argparse.ArgumentParser(description="Plot Kafka lag from heartbeat events.")
     parser.add_argument("--output", default=str(resolve_output_path()), help="Output image path")
     return parser.parse_args()
 

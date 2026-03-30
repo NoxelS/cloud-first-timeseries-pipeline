@@ -44,6 +44,7 @@ class KafkaSettings:
 class HeartbeatSettings:
     interval_minutes: int
     include_internal_topics: bool
+    lag_group_id: str
 
 
 @lru_cache(maxsize=1)
@@ -72,6 +73,7 @@ def load_heartbeat_settings() -> HeartbeatSettings:
     return HeartbeatSettings(
         interval_minutes=_env_int("HEARTBEAT_INTERVAL_MINUTES", 15),
         include_internal_topics=_env_bool("HEARTBEAT_INCLUDE_INTERNAL_TOPICS", False),
+        lag_group_id=_env("HEARTBEAT_LAG_GROUP_ID", "heartbeat-consumer-group"),
     )
 
 

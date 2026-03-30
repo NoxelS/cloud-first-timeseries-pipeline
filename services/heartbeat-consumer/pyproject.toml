@@ -1,7 +1,7 @@
 [project]
-name = "test-consumer"
+name = "heartbeat-consumer"
 version = "0.1.0"
-description = "Kafka consumer for raw.test.event topic"
+description = "Kafka consumer for heartbeat events"
 requires-python = ">=3.10,<4.0"
 dependencies = [
     "kafka-python>=2.3.0",

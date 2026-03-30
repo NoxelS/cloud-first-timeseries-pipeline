@@ -15,7 +15,7 @@ members = [
     "db-migrations",
     "kafka-bootstrap",
     "shared",
-    "test-consumer",
+    "heartbeat-consumer",
 ]
 
 [[package]]
@@ -2114,9 +2114,9 @@ wheels = [
 ]
 
 [[package]]
-name = "test-consumer"
+name = "heartbeat-consumer"
 version = "0.1.0"
-source = { virtual = "services/test-consumer" }
+source = { virtual = "services/heartbeat-consumer" }
 dependencies = [
     { name = "kafka-python" },
     { name = "shared" },

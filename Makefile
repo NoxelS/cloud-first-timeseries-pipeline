@@ -11,7 +11,7 @@ GROUP ?=
 .PHONY: help deploy hard-deploy bootstrap down hard-down \
 	compose-validate compose-config compose-ps compose-logs compose-restart \
 	sync lint lint-fix format format-check type-check test test-unit test-integration test-cov security audit ci validate check \
-	kafka-topics kafka-topic-describe kafka-topic-create kafka-consumer-groups kafka-consumer-lag kafka-consumer-group-describe kafka-consumer-group-delete volumes-size
+	heartbeat-trigger kafka-topics kafka-topic-describe kafka-topic-create kafka-consumer-groups kafka-consumer-lag kafka-consumer-group-describe kafka-consumer-group-delete volumes-size
 
 help:
 	@echo "Common targets:"
@@ -22,6 +22,7 @@ help:
 	@echo "  test-unit / test-integration      - Focused test suites"
 	@echo "  ci                                - sync + format-check + lint + type-check + test + security + compose-validate"
 	@echo "  hard-deploy                       - Rebuild stack and recreate Postgres volumes from Atlas migrations"
+	@echo "  heartbeat-trigger                 - Run heartbeat snapshot + plot immediately"
 	@echo "Kafka quick access:"
 	@echo "  kafka-topics                      - List Kafka topics"
 	@echo "  kafka-consumer-groups             - List consumer groups"
@@ -109,6 +110,15 @@ validate: compose-validate lint type-check test
 check: format-check lint type-check test
 
 ci: sync format-check lint type-check test security compose-validate
+
+heartbeat-trigger:
+	$(COMPOSE) exec -T airflow-scheduler python -m shared.heartbeat.trigger
+	$(COMPOSE) exec -T airflow-scheduler python -m shared.heartbeat.trigger
+	$(COMPOSE) exec -T airflow-scheduler python -m shared.heartbeat.trigger
+	$(COMPOSE) exec -T airflow-scheduler python -m shared.heartbeat.trigger
+	$(COMPOSE) exec -T airflow-scheduler python -m shared.heartbeat.trigger
+	$(COMPOSE) exec -T airflow-scheduler python -m shared.heartbeat.trigger
+	$(COMPOSE) exec -T airflow-scheduler python -m shared.heartbeat.trigger
 
 kafka-topics:
 	$(COMPOSE) exec -T $(KAFKA_SERVICE) bash -lc '$(KAFKA_BIN)/kafka-topics.sh --bootstrap-server $(KAFKA_BOOTSTRAP) --list'

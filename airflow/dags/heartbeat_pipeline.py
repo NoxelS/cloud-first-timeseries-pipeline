@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import datetime
+import uuid
 from airflow.decorators import dag, task
 
 from shared.config import heartbeat_cron
-from shared.heartbeat import plot_offsets, resolve_output_path, run_heartbeat
+from shared.kafka.producer import publish_event
+from shared.kafka.topics import KafkaTopics
 
 
 @dag(
     dag_id="heartbeat_pipeline",
-    description="Collects system heartbeat checks and stores them in Postgres.",
+    description="Publishes a heartbeat event to Kafka.",
     schedule=heartbeat_cron(),
     start_date=datetime.datetime(2026, 3, 12, tzinfo=datetime.timezone.utc),
     catchup=False,
@@ -19,11 +21,16 @@ from shared.heartbeat import plot_offsets, resolve_output_path, run_heartbeat
 )
 def heartbeat_pipeline() -> None:
     @task()
-    def record_heartbeat() -> None:
-        run_heartbeat()
-        plot_offsets(resolve_output_path())
+    def publish_heartbeat_event() -> None:
+        event = {
+            "event_id": str(uuid.uuid4()),
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
+            "source": "heartbeat_pipeline",
+            "payload": {"message": "heartbeat"},
+        }
+        publish_event(KafkaTopics.HEARTBEAT.value, event)
 
-    record_heartbeat()
+    publish_heartbeat_event()
 
 
 heartbeat_pipeline()

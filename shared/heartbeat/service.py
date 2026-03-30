@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from kafka import KafkaConsumer
+from kafka.admin import KafkaAdminClient
 from kafka.structs import TopicPartition
 from sqlalchemy import text
 
@@ -70,7 +71,29 @@ def _collect_tcp_checks() -> dict[str, Any]:
     return checks
 
 
-def collect_kafka_snapshot(*, include_internal_topics: bool) -> tuple[dict[str, Any], dict[str, Any]]:
+def _committed_offsets(
+    *,
+    bootstrap_servers: str,
+    group_id: str,
+) -> tuple[dict[TopicPartition, int], str | None]:
+    admin: KafkaAdminClient | None = None
+    try:
+        admin = KafkaAdminClient(bootstrap_servers=bootstrap_servers)
+        offsets = admin.list_consumer_group_offsets(group_id)
+        return {tp: metadata.offset for tp, metadata in offsets.items()}, None
+    except Exception as exc:  # pragma: no cover - depends on runtime services
+        logger.exception("Failed to fetch committed offsets")
+        return {}, str(exc)
+    finally:
+        if admin is not None:
+            admin.close()
+
+
+def collect_kafka_snapshot(
+    *,
+    include_internal_topics: bool,
+    lag_group_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
     consumer: KafkaConsumer | None = None
     bootstrap = kafka_bootstrap_servers()
 
@@ -80,7 +103,12 @@ def collect_kafka_snapshot(*, include_internal_topics: bool) -> tuple[dict[str, 
         if not include_internal_topics:
             topics = {topic for topic in topics if not topic.startswith("__")}
 
-        offsets: dict[str, Any] = {}
+        committed_offsets, committed_error = _committed_offsets(
+            bootstrap_servers=bootstrap,
+            group_id=lag_group_id,
+        )
+
+        lags: dict[str, Any] = {}
         partition_count = 0
 
         for topic in sorted(topics):
@@ -88,15 +116,23 @@ def collect_kafka_snapshot(*, include_internal_topics: bool) -> tuple[dict[str, 
             partition_count += len(partitions)
             topic_partitions = [TopicPartition(topic, partition) for partition in sorted(partitions)]
             if not topic_partitions:
-                offsets[topic] = {}
+                lags[topic] = {}
                 continue
 
-            beginning = consumer.beginning_offsets(topic_partitions)
             end = consumer.end_offsets(topic_partitions)
-            offsets[topic] = {
-                str(tp.partition): {"beginning": beginning.get(tp), "end": end.get(tp)}
-                for tp in topic_partitions
-            }
+            topic_lags: dict[str, Any] = {}
+            for tp in topic_partitions:
+                committed = committed_offsets.get(tp)
+                end_offset = end.get(tp)
+                if committed is not None and committed < 0:
+                    committed = None
+                lag = None if committed is None or end_offset is None else max(end_offset - committed, 0)
+                topic_lags[str(tp.partition)] = {
+                    "end": end_offset,
+                    "committed": committed,
+                    "lag": lag,
+                }
+            lags[topic] = topic_lags
 
         stats = {
             "ok": True,
@@ -104,10 +140,13 @@ def collect_kafka_snapshot(*, include_internal_topics: bool) -> tuple[dict[str, 
             "topic_count": len(topics),
             "partition_count": partition_count,
             "bootstrap_connected": consumer.bootstrap_connected(),
+            "lag_group_id": lag_group_id,
         }
-        return offsets, stats
+        if committed_error:
+            stats["committed_offsets_error"] = committed_error
+        return lags, stats
     except Exception as exc:
-        logger.exception("Failed to collect Kafka offsets")
+        logger.exception("Failed to collect Kafka lag data")
         return {}, {"ok": False, "error": str(exc), "bootstrap_servers": bootstrap}
     finally:
         if consumer is not None:
@@ -139,8 +178,9 @@ def run_heartbeat() -> HeartbeatEvent:
     heartbeat_at = _utc_now()
     settings = load_heartbeat_settings()
 
-    kafka_offsets, kafka_status = collect_kafka_snapshot(
+    kafka_lags, kafka_status = collect_kafka_snapshot(
         include_internal_topics=settings.include_internal_topics,
+        lag_group_id=settings.lag_group_id,
     )
     database_status = _check_database()
 
@@ -153,7 +193,7 @@ def run_heartbeat() -> HeartbeatEvent:
 
     event = HeartbeatEvent(
         heartbeat_at=heartbeat_at,
-        kafka_offsets=kafka_offsets,
+        kafka_offsets=kafka_lags,
         system_checks=system_checks,
     )
 

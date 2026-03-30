@@ -9,7 +9,7 @@ import pytest
 
 def _load_main_module() -> ModuleType:
     module_path = Path(__file__).resolve().parents[1] / "src" / "main.py"
-    spec = importlib.util.spec_from_file_location("test_consumer_main", module_path)
+    spec = importlib.util.spec_from_file_location("heartbeat_consumer_main", module_path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

@@ -20,7 +20,7 @@ members = [
     "shared",
     "services/db-migrations",
     "services/kafka-bootstrap",
-    "services/test-consumer",
+    "services/heartbeat-consumer",
 ]
 
 [tool.uv.sources]
