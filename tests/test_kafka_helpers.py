@@ -13,4 +13,4 @@ def test_json_roundtrip() -> None:
 
 def test_publish_event_rejects_empty_payload() -> None:
     with pytest.raises(ValueError):
-        publish_event("raw.test.event", {})
+        publish_event("raw.heartbeat.event", {})

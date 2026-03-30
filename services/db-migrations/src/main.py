@@ -4,13 +4,11 @@ import logging
 import os
 import subprocess
 import sys
-from collections.abc import Iterable
 
 from sqlalchemy import inspect
 from sqlalchemy.engine.reflection import Inspector
 
-from shared.db.base import Base
-from shared.db.models import EnergyChartsFrequency
+from shared.db import Base
 from shared.db.session import create_engine
 from shared.db.settings import DATABASE_SCHEMA, load_database_settings
 
@@ -78,16 +76,6 @@ def _normalize_type_name(type_name: str) -> str:
     return replacements.get(normalized, normalized)
 
 
-def _compare_indexes(inspector: Inspector, table_name: str, expected_index_names: Iterable[str]) -> None:
-    actual = {index["name"] for index in inspector.get_indexes(table_name, schema=DATABASE_SCHEMA)}
-    missing = set(expected_index_names) - actual
-    if missing:
-        missing_csv = ", ".join(sorted(missing))
-        raise MigrationVerificationError(  # noqa: TRY003
-            f"Missing indexes for {DATABASE_SCHEMA}.{table_name}: {missing_csv}"
-        )
-
-
 def verify_schema() -> None:
     engine = create_engine()
     inspector = inspect(engine)
@@ -108,7 +96,6 @@ def verify_schema() -> None:
                 f"Column mismatch for {DATABASE_SCHEMA}.{table_name}: expected={expected!r} actual={actual!r}"
             )
 
-    _compare_indexes(inspector, EnergyChartsFrequency.__tablename__, {"idx_energy_charts_frequency_event_timestamp"})
     engine.dispose()
 
     logger.info("Schema verification succeeded for schema '%s'", DATABASE_SCHEMA)

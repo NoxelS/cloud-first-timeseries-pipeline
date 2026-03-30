@@ -16,10 +16,10 @@ def _load_main_module() -> ModuleType:
     return module
 
 
-def test_topic_name_defaults_to_test_topic(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_topic_name_defaults_to_heartbeat_topic(monkeypatch: pytest.MonkeyPatch) -> None:
     module = _load_main_module()
     monkeypatch.delenv("KAFKA_TOPIC", raising=False)
-    assert module._topic_name() == "raw.test.event"
+    assert module._topic_name() == "raw.heartbeat.event"
 
 
 def test_topic_name_uses_explicit_env(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -18,6 +18,11 @@ def _env_int(name: str, default: int) -> int:
     return int(_env(name, str(default)))
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    value = _env(name, str(default))
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class DatabaseSettings:
     host: str
@@ -36,13 +41,9 @@ class KafkaSettings:
 
 
 @dataclass(frozen=True)
-class EnergyChartsSettings:
-    region: str
-    overlap_seconds: int
-    safety_lag_seconds: int
-    initial_lookback_hours: int
-    backfill_min_complete_day_rows: int
-    backfill_chunk_days: int
+class HeartbeatSettings:
+    interval_minutes: int
+    include_internal_topics: bool
 
 
 @lru_cache(maxsize=1)
@@ -67,12 +68,17 @@ def load_kafka_settings() -> KafkaSettings:
 
 
 @lru_cache(maxsize=1)
-def load_energy_charts_settings() -> EnergyChartsSettings:
-    return EnergyChartsSettings(
-        region=_env("ENERGY_CHARTS_REGION", "DE-Freiburg"),
-        overlap_seconds=_env_int("ENERGY_CHARTS_OVERLAP_SECONDS", 60),
-        safety_lag_seconds=_env_int("ENERGY_CHARTS_SAFETY_LAG_SECONDS", 30),
-        initial_lookback_hours=_env_int("ENERGY_CHARTS_INITIAL_LOOKBACK_HOURS", 24),
-        backfill_min_complete_day_rows=_env_int("BACKFILL_MIN_COMPLETE_DAY_ROWS", 86400),
-        backfill_chunk_days=_env_int("BACKFILL_CHUNK_DAYS", 3),
+def load_heartbeat_settings() -> HeartbeatSettings:
+    return HeartbeatSettings(
+        interval_minutes=_env_int("HEARTBEAT_INTERVAL_MINUTES", 15),
+        include_internal_topics=_env_bool("HEARTBEAT_INCLUDE_INTERNAL_TOPICS", False),
     )
+
+
+def heartbeat_cron() -> str:
+    interval = load_heartbeat_settings().interval_minutes
+    if interval < 1:
+        raise ValueError("HEARTBEAT_INTERVAL_MINUTES must be >= 1")  # noqa: TRY003
+    if interval == 1:
+        return "* * * * *"
+    return f"*/{interval} * * * *"

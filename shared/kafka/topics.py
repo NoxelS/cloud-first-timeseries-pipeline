@@ -10,9 +10,4 @@ from enum import Enum
 
 
 class KafkaTopics(str, Enum):
-    TEST = "raw.test.event"
-    CMD_FEATURE_COLLECTION = "cmd.feature_collection"
-    CMD_ENERGY_CHARTS_BACKFILL = "cmd.energy_charts.backfill"
-    CMD_MODEL_TRAINING = "cmd.model_training"
-    RAW_ENERGY_CHARTS = "raw.energy_charts"
-    RAW_ENERGY_CHARTS_UPDATED = "raw.energy_charts.updated"
+    HEARTBEAT = "raw.heartbeat.event"

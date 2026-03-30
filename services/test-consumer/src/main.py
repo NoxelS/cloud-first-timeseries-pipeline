@@ -1,4 +1,4 @@
-"""Test event consumer service.
+"""Heartbeat event consumer service.
 
 Consumes events from Kafka and prints each event payload to stdout.
 """
@@ -14,8 +14,8 @@ from shared.kafka.topics import KafkaTopics
 
 
 def _topic_name() -> str:
-    topic = os.environ.get("KAFKA_TOPIC", KafkaTopics.TEST.value)
-    return topic or KafkaTopics.TEST.value
+    topic = os.environ.get("KAFKA_TOPIC", KafkaTopics.HEARTBEAT.value)
+    return topic or KafkaTopics.HEARTBEAT.value
 
 
 def main() -> None:

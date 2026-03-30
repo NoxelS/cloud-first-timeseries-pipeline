@@ -2,18 +2,20 @@
 
 from shared.config.settings import (
     DatabaseSettings,
-    EnergyChartsSettings,
+    HeartbeatSettings,
     KafkaSettings,
+    heartbeat_cron,
     load_database_settings,
-    load_energy_charts_settings,
+    load_heartbeat_settings,
     load_kafka_settings,
 )
 
 __all__ = [
     "DatabaseSettings",
-    "EnergyChartsSettings",
+    "HeartbeatSettings",
     "KafkaSettings",
+    "heartbeat_cron",
     "load_database_settings",
-    "load_energy_charts_settings",
+    "load_heartbeat_settings",
     "load_kafka_settings",
 ]

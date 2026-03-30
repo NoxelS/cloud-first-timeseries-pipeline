@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from shared.config.settings import load_database_settings, load_energy_charts_settings, load_kafka_settings
+from shared.config.settings import heartbeat_cron, load_database_settings, load_heartbeat_settings, load_kafka_settings
 
 
 def test_database_settings_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -33,17 +33,19 @@ def test_kafka_settings_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.default_partitions == 5
 
 
-def test_energy_charts_settings_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ENERGY_CHARTS_REGION", "CH-Zurich")
-    monkeypatch.setenv("ENERGY_CHARTS_OVERLAP_SECONDS", "120")
-    monkeypatch.setenv("ENERGY_CHARTS_SAFETY_LAG_SECONDS", "15")
-    monkeypatch.setenv("ENERGY_CHARTS_INITIAL_LOOKBACK_HOURS", "12")
-    monkeypatch.setenv("BACKFILL_MIN_COMPLETE_DAY_ROWS", "100")
-    monkeypatch.setenv("BACKFILL_CHUNK_DAYS", "2")
-    load_energy_charts_settings.cache_clear()
+def test_heartbeat_settings_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HEARTBEAT_INTERVAL_MINUTES", "10")
+    monkeypatch.setenv("HEARTBEAT_INCLUDE_INTERNAL_TOPICS", "true")
+    load_heartbeat_settings.cache_clear()
 
-    settings = load_energy_charts_settings()
+    settings = load_heartbeat_settings()
 
-    assert settings.region == "CH-Zurich"
-    assert settings.overlap_seconds == 120
-    assert settings.backfill_chunk_days == 2
+    assert settings.interval_minutes == 10
+    assert settings.include_internal_topics is True
+
+
+def test_heartbeat_cron_defaults_to_15_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("HEARTBEAT_INTERVAL_MINUTES", raising=False)
+    load_heartbeat_settings.cache_clear()
+
+    assert heartbeat_cron() == "*/15 * * * *"

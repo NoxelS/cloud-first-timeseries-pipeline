@@ -5,6 +5,7 @@ description = "Shared utilities for cloud-first-timeseries-pipeline"
 requires-python = ">=3.10,<4.0"
 dependencies = [
     "kafka-python>=2.3.0",
+    "matplotlib>=3.9.0",
     "psycopg[binary]>=3.3.0",
     "SQLAlchemy>=2.0.39",
 ]
