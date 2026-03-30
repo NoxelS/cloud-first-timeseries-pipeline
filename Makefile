@@ -9,10 +9,11 @@ START_DATE ?=
 END_DATE ?=2023-01-01
 REGION ?=DE-Freiburg
 
+.DEFAULT_GOAL := help
+
 .PHONY: help deploy hard-deploy bootstrap down hard-down \
 	compose-validate compose-config compose-ps compose-logs compose-restart \
-	feast-up feast-server-up feast-down feast-plan feast-apply feast-list \
-	sync lint format format-check type-check test test-cov security audit ci validate \
+	sync lint lint-fix format format-check type-check test test-unit test-integration test-cov security audit ci validate check \
 	kafka-topics kafka-topic-describe kafka-topic-create kafka-consumer-groups kafka-consumer-lag kafka-consumer-group-describe kafka-consumer-group-delete backfill-trigger volumes-size
 
 help:
@@ -20,9 +21,10 @@ help:
 	@echo "  deploy / hard-deploy              - Recreate full docker stack"
 	@echo "  down / hard-down                  - Stop stack (hard removes volumes)"
 	@echo "  compose-validate                  - Validate docker compose config"
-	@echo "  lint / type-check / test          - Local CI checks"
+	@echo "  format / lint / type-check        - Source quality checks"
+	@echo "  test-unit / test-integration      - Focused test suites"
 	@echo "  ci                                - sync + format-check + lint + type-check + test + security + compose-validate"
-	@echo "  feast-up / feast-apply / feast-list - Feast architecture quickstart"
+	@echo "  hard-deploy                       - Rebuild stack and recreate Postgres volumes from Atlas migrations"
 	@echo "Kafka quick access:"
 	@echo "  kafka-topics                      - List Kafka topics"
 	@echo "  kafka-consumer-groups             - List consumer groups"
@@ -55,24 +57,6 @@ down:
 hard-down:
 	$(COMPOSE) down -v --remove-orphans
 
-feast-up:
-	$(COMPOSE) up -d postgres-feast-init feast-ui
-
-feast-server-up:
-	$(COMPOSE) up -d feast-server
-
-feast-down:
-	$(COMPOSE) stop feast-ui feast-server
-
-feast-apply:
-	$(COMPOSE) run --rm feast-ui feast apply --skip-source-validation
-
-feast-plan:
-	$(COMPOSE) run --rm feast-ui feast plan --skip-source-validation
-
-feast-list:
-	$(COMPOSE) run --rm feast-ui feast entities list && $(COMPOSE) run --rm feast-ui feast feature-views list
-
 compose-validate:
 	$(COMPOSE) config >/dev/null
 
@@ -100,14 +84,23 @@ format-check:
 lint:
 	uv run ruff check .
 
+lint-fix:
+	uv run ruff check --fix .
+
 type-check:
-	uv run ty check
+	uv run ty check --exclude airflow/
 
 test:
-	uv run pytest tests
+	uv run pytest
+
+test-unit:
+	uv run pytest -m "not integration" tests services
+
+test-integration:
+	uv run pytest -m integration tests
 
 test-cov:
-	uv run pytest --cov --cov-config=pyproject.toml --cov-report=xml tests
+	uv run pytest --cov --cov-config=pyproject.toml --cov-report=xml
 
 security:
 	uv run bandit -r . -c pyproject.toml
@@ -116,6 +109,8 @@ audit:
 	uv run pip-audit
 
 validate: compose-validate lint type-check test
+
+check: format-check lint type-check test
 
 ci: sync format-check lint type-check test security compose-validate
 

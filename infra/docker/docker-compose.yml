@@ -82,21 +82,18 @@ x-airflow-common:
     AIRFLOW_CONFIG: '/opt/airflow/config/airflow.cfg'
     PYTHONPATH: /opt/airflow
     KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
-    FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
-    FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
-    FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
-    FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
-    FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
-    FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
-    FEAST_REPO_PATH: ${FEAST_REPO_PATH:-/opt/airflow/feast/feature_repo}
-    RAW_SCHEMA: ${RAW_SCHEMA:-raw}
+    DATABASE_HOST: ${DATABASE_HOST}
+    DATABASE_PORT: ${DATABASE_PORT}
+    DATABASE_NAME: ${DATABASE_NAME}
+    DATABASE_SCHEMA: ${DATABASE_SCHEMA:-raw}
+    DATABASE_USER: ${DATABASE_USER}
+    DATABASE_PASSWORD: ${DATABASE_PASSWORD}
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
     - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
     - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
     - ../../shared:/opt/airflow/shared
-    - ../../feast:/opt/airflow/feast
   user: "${AIRFLOW_UID:-50000}:0"
   depends_on:
     &airflow-common-depends-on
@@ -147,6 +144,23 @@ services:
         condition: service_healthy
     restart: "no"
 
+  db-migrations:
+    build:
+      context: ../..
+      dockerfile: services/db-migrations/Dockerfile
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      DATABASE_HOST: ${DATABASE_HOST}
+      DATABASE_PORT: ${DATABASE_PORT}
+      DATABASE_NAME: ${DATABASE_NAME}
+      DATABASE_SCHEMA: ${DATABASE_SCHEMA:-raw}
+      DATABASE_USER: ${DATABASE_USER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   test-consumer:
     build:
       context: ../..
@@ -161,39 +175,6 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
 
-  feature-view-service:
-    build:
-      context: ../..
-      dockerfile: services/feature-view-service/Dockerfile
-    environment:
-      TZ: ${TZ:-Europe/Berlin}
-      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
-      KAFKA_TOPIC: raw.energy_charts.updated
-      KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP:-none}
-      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
-      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
-      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
-      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA:-feast}
-      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
-      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
-      FEATURE_VIEW_OUTPUT_DIR: /app/output
-      FEATURE_VIEW_LOOKBACK_DAYS: ${FEATURE_VIEW_LOOKBACK_DAYS:-30}
-      FEATURE_VIEW_MAX_ROWS: ${FEATURE_VIEW_MAX_ROWS:-20000}
-      FEATURE_VIEW_PROFILE_MAX_ROWS: ${FEATURE_VIEW_PROFILE_MAX_ROWS:-50000}
-      FEATURE_VIEW_DISPLAY_TZ: ${FEATURE_VIEW_DISPLAY_TZ:-Europe/Berlin}
-      KAFKA_MAX_POLL_INTERVAL_MS: ${KAFKA_MAX_POLL_INTERVAL_MS:-1800000}
-      KAFKA_SESSION_TIMEOUT_MS: ${KAFKA_SESSION_TIMEOUT_MS:-30000}
-    volumes:
-      - ../../artifacts/feature-view:/app/output
-    depends_on:
-      kafka-broker:
-        condition: service_healthy
-      kafka-bootstrap:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-
   energy-charts-backfill-service:
     build:
       context: ../..
@@ -203,13 +184,12 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
       KAFKA_TOPIC: cmd.energy_charts.backfill
       KAFKA_CONSUMER_GROUP: energy-charts-backfill-service
-      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
-      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
-      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
-      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA:-feast}
-      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
-      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
-      RAW_SCHEMA: ${RAW_SCHEMA:-raw}
+      DATABASE_HOST: ${DATABASE_HOST}
+      DATABASE_PORT: ${DATABASE_PORT}
+      DATABASE_NAME: ${DATABASE_NAME}
+      DATABASE_SCHEMA: ${DATABASE_SCHEMA:-raw}
+      DATABASE_USER: ${DATABASE_USER}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
       ENERGY_CHARTS_REGION: ${ENERGY_CHARTS_REGION:-DE-Freiburg}
       BACKFILL_MIN_COMPLETE_DAY_ROWS: ${BACKFILL_MIN_COMPLETE_DAY_ROWS:-86400}
       BACKFILL_CHUNK_DAYS: ${BACKFILL_CHUNK_DAYS:-3}
@@ -218,8 +198,8 @@ services:
         condition: service_healthy
       kafka-bootstrap:
         condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
+      db-migrations:
+        condition: service_completed_successfully
     restart: unless-stopped
 
   postgres:
@@ -232,6 +212,8 @@ services:
       POSTGRES_DB: airflow
     volumes:
       - postgres-db-volume:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
@@ -257,64 +239,6 @@ services:
       start_period: 30s
     restart: always
 
-  feast-ui:
-    build:
-      context: ../..
-      dockerfile: feast/Dockerfile
-    command: ["feast", "ui", "--host", "0.0.0.0", "--port", "8888"]
-    working_dir: /app/feast/feature_repo
-    environment:
-      TZ: ${TZ:-Europe/Berlin}
-      FEAST_REGISTRY_DB_URL: ${FEAST_REGISTRY_DB_URL}
-      FEAST_REDIS_CONNECTION_STRING: ${FEAST_REDIS_CONNECTION_STRING}
-      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
-      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
-      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
-      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
-      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
-      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
-    ports:
-      - "${FEAST_UI_PORT:-8888}:8888"
-    volumes:
-      - ../../feast:/app/feast
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      postgres-feast-init:
-        condition: service_completed_successfully
-    restart: unless-stopped
-
-  feast-server:
-    build:
-      context: ../..
-      dockerfile: feast/Dockerfile
-    command: ["feast", "serve", "--host", "0.0.0.0", "--port", "6566"]
-    working_dir: /app/feast/feature_repo
-    environment:
-      TZ: ${TZ:-Europe/Berlin}
-      FEAST_REGISTRY_DB_URL: ${FEAST_REGISTRY_DB_URL}
-      FEAST_REDIS_CONNECTION_STRING: ${FEAST_REDIS_CONNECTION_STRING}
-      FEAST_OFFLINE_STORE_HOST: ${FEAST_OFFLINE_STORE_HOST}
-      FEAST_OFFLINE_STORE_PORT: ${FEAST_OFFLINE_STORE_PORT}
-      FEAST_OFFLINE_STORE_DATABASE: ${FEAST_OFFLINE_STORE_DATABASE}
-      FEAST_OFFLINE_STORE_SCHEMA: ${FEAST_OFFLINE_STORE_SCHEMA}
-      FEAST_OFFLINE_STORE_USER: ${FEAST_OFFLINE_STORE_USER}
-      FEAST_OFFLINE_STORE_PASSWORD: ${FEAST_OFFLINE_STORE_PASSWORD}
-    ports:
-      - "${FEAST_SERVER_PORT:-6566}:6566"
-    volumes:
-      - ../../feast:/app/feast
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      postgres-feast-init:
-        condition: service_completed_successfully
-    restart: unless-stopped
-
   metabase:
     image: metabase/metabase:v0.56.2
     environment:
@@ -328,20 +252,6 @@ services:
       postgres:
         condition: service_healthy
     restart: unless-stopped
-
-  postgres-feast-init:
-    image: postgres:16
-    environment:
-      TZ: ${TZ:-Europe/Berlin}
-      PGPASSWORD: airflow
-    entrypoint: ["/bin/bash", "-c"]
-    command:
-      - |
-        psql -h postgres -U airflow -d airflow -v ON_ERROR_STOP=1 -c "CREATE SCHEMA IF NOT EXISTS feast;"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: "no"
 
   airflow-apiserver:
     <<: *airflow-common
@@ -359,6 +269,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+      db-migrations:
+        condition: service_completed_successfully
 
   airflow-scheduler:
     <<: *airflow-common
@@ -374,6 +286,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+      db-migrations:
+        condition: service_completed_successfully
 
   airflow-dag-processor:
     <<: *airflow-common
@@ -388,6 +302,8 @@ services:
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
+        condition: service_completed_successfully
+      db-migrations:
         condition: service_completed_successfully
 
   airflow-worker:
@@ -412,6 +328,8 @@ services:
         condition: service_healthy
       airflow-init:
         condition: service_completed_successfully
+      db-migrations:
+        condition: service_completed_successfully
 
   airflow-triggerer:
     <<: *airflow-common
@@ -426,6 +344,8 @@ services:
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
+        condition: service_completed_successfully
+      db-migrations:
         condition: service_completed_successfully
 
   airflow-init:
@@ -555,6 +475,8 @@ services:
     depends_on:
       <<: *airflow-common-depends-on
       airflow-init:
+        condition: service_completed_successfully
+      db-migrations:
         condition: service_completed_successfully
 
 volumes:

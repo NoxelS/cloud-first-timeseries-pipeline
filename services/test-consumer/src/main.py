@@ -9,34 +9,23 @@ import json
 import logging
 import os
 
-from kafka import KafkaConsumer
+from shared.kafka.consumer import create_json_consumer
 from shared.kafka.topics import KafkaTopics
 
 
-def _bootstrap_servers() -> str:
-    return os.environ["KAFKA_BOOTSTRAP_SERVERS"]
-
-
 def _topic_name() -> str:
-    return os.environ.get("KAFKA_TOPIC", KafkaTopics.TEST.value)
+    topic = os.environ.get("KAFKA_TOPIC", KafkaTopics.TEST.value)
+    return topic or KafkaTopics.TEST.value
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    bootstrap = _bootstrap_servers()
     topic = _topic_name()
 
-    logging.info("Starting test consumer on topic '%s' via %s", topic, bootstrap)
+    logging.info("Starting test consumer on topic '%s'", topic)
 
-    consumer = KafkaConsumer(
-        topic,
-        bootstrap_servers=bootstrap,
-        auto_offset_reset="earliest",
-        enable_auto_commit=True,
-        group_id="test-consumer-group",
-        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
-    )
+    consumer = create_json_consumer(topic, group_id="test-consumer-group", auto_offset_reset="earliest")
 
     try:
         for message in consumer:

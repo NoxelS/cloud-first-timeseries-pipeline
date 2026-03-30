@@ -7,6 +7,7 @@ repos:
       - id: check-toml
       - id: check-yaml
       - id: check-json
+      - id: check-added-large-files
       - id: pretty-format-json
         args: [--autofix, --no-sort-keys]
       - id: end-of-file-fixer
@@ -31,3 +32,15 @@ repos:
       - id: vulture
         args: ["--min-confidence", "80"]
 
+  - repo: https://github.com/Yelp/detect-secrets
+    rev: "v1.5.0"
+    hooks:
+      - id: detect-secrets
+
+  - repo: local
+    hooks:
+      - id: ty-check
+        name: ty-check
+        entry: uv run ty check --exclude airflow/
+        language: system
+        pass_filenames: false

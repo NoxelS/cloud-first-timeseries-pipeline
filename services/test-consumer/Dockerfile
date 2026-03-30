@@ -5,10 +5,10 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 
-RUN uv pip install --system "kafka-python>=2.3.0"
-
+COPY pyproject.toml uv.lock ./
 COPY shared ./shared
-RUN uv pip install --system /app/shared
-COPY services/test-consumer/src ./services/test-consumer/src
+COPY services/test-consumer ./services/test-consumer
 
-CMD ["python", "services/test-consumer/src/main.py"]
+RUN uv sync --project services/test-consumer --no-dev
+
+CMD ["uv", "run", "--project", "services/test-consumer", "python", "services/test-consumer/src/main.py"]

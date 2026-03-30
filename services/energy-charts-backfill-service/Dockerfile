@@ -5,11 +5,10 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 
-RUN uv pip install --system "kafka-python>=2.3.0" "psycopg[binary]>=3.3.0"
-
+COPY pyproject.toml uv.lock ./
 COPY shared ./shared
-RUN uv pip install --system /app/shared
+COPY services/energy-charts-backfill-service ./services/energy-charts-backfill-service
 
-COPY services/energy-charts-backfill-service/src ./services/energy-charts-backfill-service/src
+RUN uv sync --project services/energy-charts-backfill-service --no-dev
 
-CMD ["python", "services/energy-charts-backfill-service/src/main.py"]
+CMD ["uv", "run", "--project", "services/energy-charts-backfill-service", "python", "services/energy-charts-backfill-service/src/main.py"]

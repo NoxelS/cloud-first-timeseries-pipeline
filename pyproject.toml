@@ -1,13 +1,12 @@
 [project]
 name = "cloud-first-timeseries-pipeline"
 version = "0.1.0"
-description = "Cloud-first, event-driven platform for collecting time series data, building feature pipelines, and preparing datasets for forecasting. Built with Kafka, Airflow, Feast, and Docker."
+description = "Cloud-first, event-driven platform for collecting time series data, building feature pipelines, and preparing datasets for forecasting. Built with Kafka, Airflow, Postgres, SQLAlchemy, Atlas, and Docker."
 authors = [{ name = "Noel Schwabenland", email = "noel@schwabenland.ch" }]
 readme = "README.md"
 keywords = ['python']
 requires-python = ">=3.10,<4.0"
 dependencies = [
-    "feast[postgres,redis]>=0.61.0,<0.62.0",
     "kafka-python>=2.3.0",
     "responses>=0.26.0",
     "shared",
@@ -19,10 +18,10 @@ package = false
 [tool.uv.workspace]
 members = [
     "shared",
-    "services/eurostat_collector",
-    "services/example_source_collector",
+    "services/db-migrations",
+    "services/energy-charts-backfill-service",
+    "services/kafka-bootstrap",
     "services/test-consumer",
-    "services/energy_charts_collector",
 ]
 
 [tool.uv.sources]
@@ -35,6 +34,7 @@ Documentation = "https://NoxelS.github.io/cloud-first-timeseries-pipeline/"
 
 [dependency-groups]
 dev = [
+    "detect-secrets>=1.5.0",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
     "pytest-xdist>=3.6.0",
@@ -51,7 +51,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "services"]
 addopts = "--strict-markers --disable-warnings"
 markers = [
     "coverage: marks tests as critical for coverage (deselect with '-m \"not coverage\"')",
@@ -67,8 +67,12 @@ fix = true
 
 [tool.ruff.lint]
 select = [
+    # flake8-annotations
+    "ANN",
     # flake8-2020
     "YTT",
+    # flake8-datetimez
+    "DTZ",
     # flake8-bandit
     "S",
     # flake8-bugbear
@@ -81,6 +85,10 @@ select = [
     "T10",
     # flake8-pie
     "PIE",
+    # flake8-logging-format
+    "G",
+    # flake8-return
+    "RET",
     # flake8-simplify
     "SIM",
     # isort
@@ -93,6 +101,8 @@ select = [
     "F",
     # pygrep-hooks
     "PGH",
+    # eradicate
+    "ERA",
     # pyupgrade
     "UP",
     # ruff
@@ -109,6 +119,8 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]
+"services/*/tests/*" = ["S101"]
+"airflow/dags/*" = ["ANN201"]
 
 [tool.ruff.format]
 preview = true
@@ -116,4 +128,10 @@ preview = true
 [tool.bandit]
 exclude_dirs = ["tests", "venv"]
 
+[tool.coverage.run]
+branch = true
+source = ["shared", "services", "scripts", "airflow/dags"]
 
+[tool.coverage.report]
+fail_under = 70
+skip_covered = true

@@ -1,467 +1,76 @@
-"""Incrementally ingest second-level Energy Charts frequency data into the raw store."""
-
-# ruff: noqa: S608
+"""Incrementally ingest second-level Energy Charts frequency data into Postgres."""
 
 from __future__ import annotations
 
 import datetime
 import logging
-import os
 import uuid
 from typing import Any
 
-import psycopg
 from airflow.sdk import dag, task
 
 from shared.adapters.energy_charts.collector import collect_frequency_events_for_range
+from shared.config import EnergyChartsSettings, load_energy_charts_settings
+from shared.db.repositories import get_ingestion_state, upsert_frequency_events, upsert_ingestion_state
+from shared.db.session import session_scope
+from shared.energy_charts.events import RawWindowPayload, build_raw_update_event, normalize_events
+from shared.energy_charts.series import series_id_for_region
+from shared.energy_charts.time import parse_iso_timestamp, utc_now
 from shared.kafka.producer import publish_event
 from shared.kafka.topics import KafkaTopics
 
 logger = logging.getLogger(__name__)
 
-_RAW_SCHEMA = os.environ.get("RAW_SCHEMA", "raw")
-_FEAST_SCHEMA = os.environ.get("FEAST_OFFLINE_STORE_SCHEMA", "feast")
 _PIPELINE_NAME = "energy-charts-feature-pipeline"
-_OVERLAP_SECONDS = int(os.environ.get("ENERGY_CHARTS_OVERLAP_SECONDS", "60"))
-_SAFETY_LAG_SECONDS = int(os.environ.get("ENERGY_CHARTS_SAFETY_LAG_SECONDS", "30"))
-_INITIAL_LOOKBACK_HOURS = int(os.environ.get("ENERGY_CHARTS_INITIAL_LOOKBACK_HOURS", "24"))
 
 
-def _db_connection() -> psycopg.Connection:
-    return psycopg.connect(
-        host=os.environ["FEAST_OFFLINE_STORE_HOST"],
-        port=int(os.environ.get("FEAST_OFFLINE_STORE_PORT", "5432")),
-        dbname=os.environ["FEAST_OFFLINE_STORE_DATABASE"],
-        user=os.environ["FEAST_OFFLINE_STORE_USER"],
-        password=os.environ["FEAST_OFFLINE_STORE_PASSWORD"],
-    )
-
-
-def _parse_iso_ts(value: str) -> datetime.datetime:
-    parsed = value.replace("Z", "+00:00") if value.endswith("Z") else value
-    dt = datetime.datetime.fromisoformat(parsed)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return dt.astimezone(datetime.timezone.utc)
-
-
-def _ensure_tables(conn: psycopg.Connection) -> None:
-    with conn.cursor() as cursor:
-        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_RAW_SCHEMA}")
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_RAW_SCHEMA}.energy_charts_frequency (
-                event_id TEXT NOT NULL,
-                series_id TEXT NOT NULL,
-                event_timestamp TIMESTAMPTZ NOT NULL,
-                frequency_hz DOUBLE PRECISION NULL,
-                source_region TEXT NOT NULL,
-                request_id TEXT NOT NULL,
-                collected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                CONSTRAINT uq_energy_charts_frequency_series_ts UNIQUE (series_id, event_timestamp)
-            )
-            """
-        )
-        cursor.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_raw_energy_charts_frequency_event_ts
-            ON {_RAW_SCHEMA}.energy_charts_frequency (event_timestamp)
-            """
-        )
-        cursor.execute(
-            """
-            SELECT 1
-            FROM pg_indexes
-            WHERE schemaname = %s
-              AND tablename = 'energy_charts_frequency'
-              AND indexname = 'ux_raw_energy_charts_frequency_series_ts'
-            """,
-            (_RAW_SCHEMA,),
-        )
-        has_unique_index = cursor.fetchone() is not None
-        if not has_unique_index:
-            cursor.execute("SELECT pg_advisory_lock(hashtext(%s))", (f"{_RAW_SCHEMA}.energy_charts_frequency.unique",))
-            try:
-                cursor.execute(
-                    """
-                    SELECT 1
-                    FROM pg_indexes
-                    WHERE schemaname = %s
-                      AND tablename = 'energy_charts_frequency'
-                      AND indexname = 'ux_raw_energy_charts_frequency_series_ts'
-                    """,
-                    (_RAW_SCHEMA,),
-                )
-                if cursor.fetchone() is None:
-                    cursor.execute(
-                        f"""
-                        DELETE FROM {_RAW_SCHEMA}.energy_charts_frequency target
-                        USING (
-                            SELECT ctid
-                            FROM (
-                                SELECT
-                                    ctid,
-                                    ROW_NUMBER() OVER (
-                                        PARTITION BY series_id, event_timestamp
-                                        ORDER BY collected_at DESC, ctid DESC
-                                    ) AS row_num
-                                FROM {_RAW_SCHEMA}.energy_charts_frequency
-                            ) ranked
-                            WHERE ranked.row_num > 1
-                        ) duplicates
-                        WHERE target.ctid = duplicates.ctid
-                        """
-                    )
-                    cursor.execute(
-                        f"""
-                        CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_energy_charts_frequency_series_ts
-                        ON {_RAW_SCHEMA}.energy_charts_frequency (series_id, event_timestamp)
-                        """
-                    )
-            finally:
-                cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (f"{_RAW_SCHEMA}.energy_charts_frequency.unique",))
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_RAW_SCHEMA}.energy_charts_ingestion_state (
-                series_id TEXT NOT NULL,
-                pipeline_name TEXT NOT NULL,
-                last_ingested_ts TIMESTAMPTZ NULL,
-                backfill_cursor_date DATE NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                status TEXT NOT NULL DEFAULT 'idle',
-                PRIMARY KEY (series_id, pipeline_name)
-            )
-            """
-        )
-        cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {_FEAST_SCHEMA}")
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_FEAST_SCHEMA}.grid_frequency_5m (
-                series_id TEXT NOT NULL,
-                event_timestamp TIMESTAMPTZ NOT NULL,
-                source_region TEXT NULL,
-                frequency_mean_hz DOUBLE PRECISION NULL,
-                frequency_min_hz DOUBLE PRECISION NULL,
-                frequency_max_hz DOUBLE PRECISION NULL,
-                frequency_stddev_hz DOUBLE PRECISION NULL,
-                sample_count BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (series_id, event_timestamp)
-            )
-            """
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ADD COLUMN IF NOT EXISTS source_region TEXT"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ADD COLUMN IF NOT EXISTS frequency_mean_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ADD COLUMN IF NOT EXISTS frequency_min_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ADD COLUMN IF NOT EXISTS frequency_max_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ADD COLUMN IF NOT EXISTS frequency_stddev_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ADD COLUMN IF NOT EXISTS sample_count BIGINT"
-        )
-        cursor.execute(
-            f"""
-            DO $$
-            BEGIN
-                IF EXISTS (
-                    SELECT 1
-                    FROM information_schema.columns
-                    WHERE table_schema = '{_FEAST_SCHEMA}'
-                      AND table_name = 'grid_frequency_5m'
-                      AND column_name = 'frequency_hz'
-                ) THEN
-                    EXECUTE '
-                        UPDATE {_FEAST_SCHEMA}.grid_frequency_5m
-                        SET frequency_mean_hz = COALESCE(frequency_mean_hz, frequency_hz),
-                            frequency_min_hz = COALESCE(frequency_min_hz, frequency_hz),
-                            frequency_max_hz = COALESCE(frequency_max_hz, frequency_hz),
-                            sample_count = COALESCE(sample_count, 1)
-                        WHERE frequency_mean_hz IS NULL
-                           OR frequency_min_hz IS NULL
-                           OR frequency_max_hz IS NULL
-                           OR sample_count IS NULL
-                    ';
-                END IF;
-            END $$;
-            """
-        )
-        cursor.execute(
-            f"UPDATE {_FEAST_SCHEMA}.grid_frequency_5m SET sample_count = 1 WHERE sample_count IS NULL"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_5m ALTER COLUMN sample_count SET NOT NULL"
-        )
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_FEAST_SCHEMA}.grid_frequency_15m (
-                series_id TEXT NOT NULL,
-                event_timestamp TIMESTAMPTZ NOT NULL,
-                source_region TEXT NULL,
-                frequency_mean_hz DOUBLE PRECISION NULL,
-                frequency_min_hz DOUBLE PRECISION NULL,
-                frequency_max_hz DOUBLE PRECISION NULL,
-                frequency_stddev_hz DOUBLE PRECISION NULL,
-                sample_count BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (series_id, event_timestamp)
-            )
-            """
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ADD COLUMN IF NOT EXISTS source_region TEXT"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ADD COLUMN IF NOT EXISTS frequency_mean_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ADD COLUMN IF NOT EXISTS frequency_min_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ADD COLUMN IF NOT EXISTS frequency_max_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ADD COLUMN IF NOT EXISTS frequency_stddev_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ADD COLUMN IF NOT EXISTS sample_count BIGINT"
-        )
-        cursor.execute(
-            f"UPDATE {_FEAST_SCHEMA}.grid_frequency_15m SET sample_count = 1 WHERE sample_count IS NULL"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_15m ALTER COLUMN sample_count SET NOT NULL"
-        )
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {_FEAST_SCHEMA}.grid_frequency_1h (
-                series_id TEXT NOT NULL,
-                event_timestamp TIMESTAMPTZ NOT NULL,
-                source_region TEXT NULL,
-                frequency_mean_hz DOUBLE PRECISION NULL,
-                frequency_min_hz DOUBLE PRECISION NULL,
-                frequency_max_hz DOUBLE PRECISION NULL,
-                frequency_stddev_hz DOUBLE PRECISION NULL,
-                sample_count BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (series_id, event_timestamp)
-            )
-            """
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ADD COLUMN IF NOT EXISTS source_region TEXT"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ADD COLUMN IF NOT EXISTS frequency_mean_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ADD COLUMN IF NOT EXISTS frequency_min_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ADD COLUMN IF NOT EXISTS frequency_max_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ADD COLUMN IF NOT EXISTS frequency_stddev_hz DOUBLE PRECISION"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ADD COLUMN IF NOT EXISTS sample_count BIGINT"
-        )
-        cursor.execute(
-            f"UPDATE {_FEAST_SCHEMA}.grid_frequency_1h SET sample_count = 1 WHERE sample_count IS NULL"
-        )
-        cursor.execute(
-            f"ALTER TABLE {_FEAST_SCHEMA}.grid_frequency_1h ALTER COLUMN sample_count SET NOT NULL"
-        )
-
-
-def _upsert_aggregates(conn: psycopg.Connection, start_ts: datetime.datetime, end_ts: datetime.datetime) -> int:
-    with conn.cursor() as cursor:
-        cursor.execute(
-            f"""
-            INSERT INTO {_FEAST_SCHEMA}.grid_frequency_5m (
-                series_id,
-                event_timestamp,
-                source_region,
-                frequency_mean_hz,
-                frequency_min_hz,
-                frequency_max_hz,
-                frequency_stddev_hz,
-                sample_count,
-                created_at
-            )
-            SELECT
-                series_id,
-                date_bin(interval '5 minutes', event_timestamp, '1970-01-01'::timestamptz) AS bucket_ts,
-                MAX(source_region) AS source_region,
-                AVG(frequency_hz) AS frequency_mean_hz,
-                MIN(frequency_hz) AS frequency_min_hz,
-                MAX(frequency_hz) AS frequency_max_hz,
-                STDDEV_SAMP(frequency_hz) AS frequency_stddev_hz,
-                COUNT(frequency_hz) AS sample_count,
-                NOW()
-            FROM {_RAW_SCHEMA}.energy_charts_frequency
-            WHERE event_timestamp >= %s
-              AND event_timestamp < %s
-            GROUP BY series_id, bucket_ts
-            ON CONFLICT (series_id, event_timestamp)
-            DO UPDATE SET
-                frequency_mean_hz = EXCLUDED.frequency_mean_hz,
-                source_region = EXCLUDED.source_region,
-                frequency_min_hz = EXCLUDED.frequency_min_hz,
-                frequency_max_hz = EXCLUDED.frequency_max_hz,
-                frequency_stddev_hz = EXCLUDED.frequency_stddev_hz,
-                sample_count = EXCLUDED.sample_count,
-                created_at = NOW()
-            """,
-            (start_ts, end_ts),
-        )
-        affected_5m = max(cursor.rowcount, 0)
-        cursor.execute(
-            f"""
-            INSERT INTO {_FEAST_SCHEMA}.grid_frequency_15m (
-                series_id,
-                event_timestamp,
-                source_region,
-                frequency_mean_hz,
-                frequency_min_hz,
-                frequency_max_hz,
-                frequency_stddev_hz,
-                sample_count,
-                created_at
-            )
-            SELECT
-                series_id,
-                date_bin(interval '15 minutes', event_timestamp, '1970-01-01'::timestamptz) AS bucket_ts,
-                MAX(source_region) AS source_region,
-                AVG(frequency_hz) AS frequency_mean_hz,
-                MIN(frequency_hz) AS frequency_min_hz,
-                MAX(frequency_hz) AS frequency_max_hz,
-                STDDEV_SAMP(frequency_hz) AS frequency_stddev_hz,
-                COUNT(frequency_hz) AS sample_count,
-                NOW()
-            FROM {_RAW_SCHEMA}.energy_charts_frequency
-            WHERE event_timestamp >= %s
-              AND event_timestamp < %s
-            GROUP BY series_id, bucket_ts
-            ON CONFLICT (series_id, event_timestamp)
-            DO UPDATE SET
-                frequency_mean_hz = EXCLUDED.frequency_mean_hz,
-                source_region = EXCLUDED.source_region,
-                frequency_min_hz = EXCLUDED.frequency_min_hz,
-                frequency_max_hz = EXCLUDED.frequency_max_hz,
-                frequency_stddev_hz = EXCLUDED.frequency_stddev_hz,
-                sample_count = EXCLUDED.sample_count,
-                created_at = NOW()
-            """,
-            (start_ts, end_ts),
-        )
-        affected_15m = max(cursor.rowcount, 0)
-        cursor.execute(
-            f"""
-            INSERT INTO {_FEAST_SCHEMA}.grid_frequency_1h (
-                series_id,
-                event_timestamp,
-                source_region,
-                frequency_mean_hz,
-                frequency_min_hz,
-                frequency_max_hz,
-                frequency_stddev_hz,
-                sample_count,
-                created_at
-            )
-            SELECT
-                series_id,
-                date_bin(interval '1 hour', event_timestamp, '1970-01-01'::timestamptz) AS bucket_ts,
-                MAX(source_region) AS source_region,
-                AVG(frequency_hz) AS frequency_mean_hz,
-                MIN(frequency_hz) AS frequency_min_hz,
-                MAX(frequency_hz) AS frequency_max_hz,
-                STDDEV_SAMP(frequency_hz) AS frequency_stddev_hz,
-                COUNT(frequency_hz) AS sample_count,
-                NOW()
-            FROM {_RAW_SCHEMA}.energy_charts_frequency
-            WHERE event_timestamp >= %s
-              AND event_timestamp < %s
-            GROUP BY series_id, bucket_ts
-            ON CONFLICT (series_id, event_timestamp)
-            DO UPDATE SET
-                frequency_mean_hz = EXCLUDED.frequency_mean_hz,
-                source_region = EXCLUDED.source_region,
-                frequency_min_hz = EXCLUDED.frequency_min_hz,
-                frequency_max_hz = EXCLUDED.frequency_max_hz,
-                frequency_stddev_hz = EXCLUDED.frequency_stddev_hz,
-                sample_count = EXCLUDED.sample_count,
-                created_at = NOW()
-            """,
-            (start_ts, end_ts),
-        )
-        affected_1h = max(cursor.rowcount, 0)
-
-    return affected_5m + affected_15m + affected_1h
-
-
-def _series_id_for_region(region: str) -> str:
-    return f"{region.lower()}::grid_frequency"
+def _settings() -> EnergyChartsSettings:
+    return load_energy_charts_settings()
 
 
 @dag(
     dag_id="energy-charts-feature-pipeline",
     description="Incremental raw frequency ingestion with cursor-based windows.",
     schedule="*/5 * * * *",
-    start_date=datetime.datetime(2026, 3, 13),
+    start_date=datetime.datetime(2026, 3, 13, tzinfo=datetime.timezone.utc),
     catchup=False,
     tags=["energy-charts", "raw"],
 )
 def energy_charts_feature_pipeline() -> None:  # noqa: C901
     @task()
     def prepare_window() -> dict[str, Any]:
-        region = os.environ.get("ENERGY_CHARTS_REGION", "DE-Freiburg")
-        series_id = _series_id_for_region(region)
-        window_end = datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(seconds=_SAFETY_LAG_SECONDS)
+        settings = _settings()
+        region = settings.region
+        series_id = series_id_for_region(region)
+        # Keep a small safety lag so we do not ingest points still being published upstream.
+        window_end = utc_now() - datetime.timedelta(seconds=settings.safety_lag_seconds)
 
-        with _db_connection() as conn:
-            _ensure_tables(conn)
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    f"""
-                    SELECT last_ingested_ts
-                    FROM {_RAW_SCHEMA}.energy_charts_ingestion_state
-                    WHERE series_id = %s AND pipeline_name = %s
-                    """,
-                    (series_id, _PIPELINE_NAME),
-                )
-                row = cursor.fetchone()
+        with session_scope() as session:
+            state = get_ingestion_state(session, series_id=series_id, pipeline_name=_PIPELINE_NAME)
 
-        if row and row[0]:
-            last_ingested_ts = row[0].astimezone(datetime.timezone.utc)
-            window_start = last_ingested_ts - datetime.timedelta(seconds=_OVERLAP_SECONDS)
+        if state and state.last_ingested_ts:
+            last_ingested_ts = state.last_ingested_ts.astimezone(datetime.timezone.utc)
+            # Re-read a small overlap window to tolerate late-arriving or corrected samples.
+            window_start = last_ingested_ts - datetime.timedelta(seconds=settings.overlap_seconds)
         else:
-            window_start = window_end - datetime.timedelta(hours=_INITIAL_LOOKBACK_HOURS)
+            window_start = window_end - datetime.timedelta(hours=settings.initial_lookback_hours)
 
         if window_start >= window_end:
             window_start = window_end - datetime.timedelta(minutes=1)
 
-        return {
-            "request_id": str(uuid.uuid4()),
-            "region": region,
-            "series_id": series_id,
-            "window_start": window_start.isoformat(),
-            "window_end": window_end.isoformat(),
-        }
+        return RawWindowPayload(
+            request_id=str(uuid.uuid4()),
+            region=region,
+            series_id=series_id,
+            window_start=window_start.isoformat(),
+            window_end=window_end.isoformat(),
+        ).__dict__
 
     @task()
     def collect_raw_events(window: dict[str, Any]) -> dict[str, Any]:
         payload = collect_frequency_events_for_range(
-            window_start=_parse_iso_ts(window["window_start"]),
-            window_end=_parse_iso_ts(window["window_end"]),
+            window_start=parse_iso_timestamp(window["window_start"]),
+            window_end=parse_iso_timestamp(window["window_end"]),
             region=window["region"],
             request_id=window["request_id"],
         )
@@ -479,52 +88,14 @@ def energy_charts_feature_pipeline() -> None:  # noqa: C901
         events = payload.get("events", [])
         if not events:
             payload["rows_written"] = 0
+            payload["max_event_timestamp"] = None
             return payload
 
-        max_event_ts: datetime.datetime | None = None
-        with _db_connection() as conn:
-            _ensure_tables(conn)
-            with conn.cursor() as cursor:
-                rows = []
-                for event in events:
-                    event_ts = _parse_iso_ts(event["event_timestamp"])
-                    if max_event_ts is None or event_ts > max_event_ts:
-                        max_event_ts = event_ts
-                    rows.append((
-                        event["event_id"],
-                        event["series_id"],
-                        event_ts,
-                        event.get("frequency_hz"),
-                        event["source_region"],
-                        event["request_id"],
-                        _parse_iso_ts(event["collected_at"]),
-                    ))
-                cursor.executemany(
-                    f"""
-                    INSERT INTO {_RAW_SCHEMA}.energy_charts_frequency (
-                        event_id,
-                        series_id,
-                        event_timestamp,
-                        frequency_hz,
-                        source_region,
-                        request_id,
-                        collected_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (series_id, event_timestamp)
-                    DO UPDATE SET
-                        event_id = EXCLUDED.event_id,
-                        frequency_hz = EXCLUDED.frequency_hz,
-                        source_region = EXCLUDED.source_region,
-                        request_id = EXCLUDED.request_id,
-                        collected_at = EXCLUDED.collected_at
-                    """,
-                    rows,
-                )
-                payload["rows_written"] = max(cursor.rowcount, 0)
-            conn.commit()
+        with session_scope() as session:
+            result = upsert_frequency_events(session, normalize_events(events))
 
-        payload["max_event_timestamp"] = max_event_ts.isoformat() if max_event_ts else None
+        payload["rows_written"] = result.rows_written
+        payload["max_event_timestamp"] = result.max_event_timestamp.isoformat() if result.max_event_timestamp else None
         return payload
 
     @task()
@@ -534,71 +105,36 @@ def energy_charts_feature_pipeline() -> None:  # noqa: C901
             logger.info("No max event timestamp; ingestion cursor remains unchanged.")
             return payload
 
-        with _db_connection() as conn, conn.cursor() as cursor:
-            cursor.execute(
-                f"""
-                INSERT INTO {_RAW_SCHEMA}.energy_charts_ingestion_state (
-                    series_id,
-                    pipeline_name,
-                    last_ingested_ts,
-                    updated_at,
-                    status
-                )
-                VALUES (%s, %s, %s, NOW(), %s)
-                ON CONFLICT (series_id, pipeline_name)
-                DO UPDATE SET
-                    last_ingested_ts = GREATEST(
-                        {_RAW_SCHEMA}.energy_charts_ingestion_state.last_ingested_ts,
-                        EXCLUDED.last_ingested_ts
-                    ),
-                    updated_at = NOW(),
-                    status = EXCLUDED.status
-                """,
-                (payload["series_id"], _PIPELINE_NAME, _parse_iso_ts(max_event_ts), "live"),
+        with session_scope() as session:
+            upsert_ingestion_state(
+                session,
+                series_id=payload["series_id"],
+                pipeline_name=_PIPELINE_NAME,
+                last_ingested_ts=parse_iso_timestamp(max_event_ts),
+                backfill_cursor_date=None,
+                status="live",
             )
-            conn.commit()
-        return payload
-
-    @task()
-    def aggregate_feature_tables(payload: dict[str, Any]) -> dict[str, Any]:
-        max_event_ts = payload.get("max_event_timestamp")
-        if not max_event_ts:
-            payload["feature_rows_written"] = 0
-            return payload
-
-        start_ts = _parse_iso_ts(payload["window_start"])
-        end_ts = _parse_iso_ts(payload["window_end"])
-        with _db_connection() as conn:
-            _ensure_tables(conn)
-            affected_rows = _upsert_aggregates(conn, start_ts=start_ts, end_ts=end_ts)
-            conn.commit()
-        payload["feature_rows_written"] = affected_rows
         return payload
 
     @task()
     def publish_raw_update_trigger(payload: dict[str, Any]) -> None:
-        if payload.get("feature_rows_written", 0) <= 0:
-            logger.info("Skipping raw update trigger; no feature rows written.")
+        if payload.get("rows_written", 0) <= 0:
+            logger.info("Skipping raw update trigger; no rows written.")
             return
 
-        event = {
-            "event_id": str(uuid.uuid4()),
-            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc).isoformat(),
-            "source": _PIPELINE_NAME,
-            "pipeline": _PIPELINE_NAME,
-            "series_id": payload["series_id"],
-            "window_start": payload["window_start"],
-            "window_end": payload["window_end"],
-            "rows_written": payload["rows_written"],
-            "feature_rows_written": payload["feature_rows_written"],
-        }
+        event = build_raw_update_event(
+            pipeline_name=_PIPELINE_NAME,
+            series_id=payload["series_id"],
+            window_start=payload["window_start"],
+            window_end=payload["window_end"],
+            rows_written=payload["rows_written"],
+        )
         publish_event(KafkaTopics.RAW_ENERGY_CHARTS_UPDATED.value, event)
 
     window = prepare_window()
     payload = collect_raw_events(window)
     payload = write_raw_table(payload)
     payload = update_ingestion_state(payload)
-    payload = aggregate_feature_tables(payload)
     publish_raw_update_trigger(payload)
 
 

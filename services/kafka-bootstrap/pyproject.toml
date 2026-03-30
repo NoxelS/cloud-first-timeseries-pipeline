@@ -1,11 +1,9 @@
 [project]
-name = "energy-charts-backfill-service"
+name = "kafka-bootstrap"
 version = "0.1.0"
-description = "Kafka-triggered historical backfill for Energy Charts frequency data"
+description = "Kafka topic bootstrap service"
 requires-python = ">=3.10,<4.0"
 dependencies = [
-    "kafka-python>=2.3.0",
-    "psycopg[binary]>=3.3.0",
     "shared",
 ]
 

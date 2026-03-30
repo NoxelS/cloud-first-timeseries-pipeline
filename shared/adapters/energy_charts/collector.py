@@ -9,24 +9,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
+from shared.energy_charts.series import series_id_for_region
+
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://api.energy-charts.info/frequency"
 _DEFAULT_REGION = "DE-Freiburg"
 _REQUEST_TIMEOUT_SECONDS = 30
-
-
-def _parse_iso_ts(value: str) -> datetime.datetime:
-    if value.endswith("Z"):
-        value = value.replace("Z", "+00:00")
-    parsed = datetime.datetime.fromisoformat(value)
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
-
-
-def _make_series_id(country: str, production_type: str) -> str:
-    return f"{country}::{production_type}"
 
 
 def _coerce_utc(value: datetime.datetime) -> datetime.datetime:
@@ -77,7 +66,7 @@ def build_raw_events(
     window_end: datetime.datetime,
     collected_at: datetime.datetime,
 ) -> list[dict[str, Any]]:
-    series = _make_series_id(region.lower(), "grid_frequency")
+    series = series_id_for_region(region)
     events: list[dict[str, Any]] = []
 
     start_utc = _coerce_utc(window_start)

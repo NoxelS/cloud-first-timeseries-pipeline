@@ -5,12 +5,11 @@ WORKDIR /app
 ENV PYTHONUNBUFFERED=1 \
     UV_LINK_MODE=copy
 
-# Install runtime dependency
-RUN uv pip install --system "kafka-python>=2.3.0"
-
-# Copy shared library and bootstrap script
+COPY pyproject.toml uv.lock ./
 COPY shared ./shared
-RUN uv pip install --system /app/shared
-COPY scripts/bootstrap_kafka_topics.py ./scripts/bootstrap_kafka_topics.py
+COPY services/kafka-bootstrap ./services/kafka-bootstrap
+COPY scripts ./scripts
 
-CMD ["python", "scripts/bootstrap_kafka_topics.py"]
+RUN uv sync --project services/kafka-bootstrap --no-dev
+
+CMD ["uv", "run", "--project", "services/kafka-bootstrap", "python", "scripts/bootstrap_kafka_topics.py"]

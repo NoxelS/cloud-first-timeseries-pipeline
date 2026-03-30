@@ -1,13 +1,13 @@
 # Cloud-First Time Series Pipeline
 
-A modular, event-driven platform for time series data.
+A modular, event-driven platform for time series data backed by Postgres, Kafka, Airflow, SQLAlchemy, and Atlas.
 
 Architecture flow:
-external sources → collector services → Kafka → Airflow pipelines → Feast feature store → future ML workflows.
-
-The `feature-view-service` consumes `raw.energy_charts.updated` events and writes matplotlib plots plus a ydata profiling report to `artifacts/feature-view/`.
+external sources → collector services → Kafka → Airflow pipelines → Postgres raw store → future ML workflows.
 
 The `energy-charts-backfill-service` consumes `cmd.energy_charts.backfill` and fills `raw.energy_charts_frequency` day-by-day backward to `2023-01-01`.
+
+Database schema management lives in the shared SQLAlchemy ORM layer under `shared/db/`, and Atlas applies migrations through the `db-migrations` service before other database consumers start.
 
 ## Manual backfill trigger
 

@@ -8,7 +8,7 @@ The system follows an **event-driven microservice architecture** built around:
 
 - Kafka for event streaming
 - Airflow for pipeline orchestration
-- Feast for feature storage
+- PostgreSQL for raw time-series storage
 - Docker for local infrastructure
 - Python for services
 
@@ -38,7 +38,7 @@ Kafka Topics
 ↓
 Airflow Pipelines
 ↓
-Feature Store (Feast)
+PostgreSQL Raw Store
 ↓
 Future Training Pipelines
 
@@ -47,7 +47,7 @@ Core idea:
 - **Collectors gather data**
 - **Kafka transports events**
 - **Airflow orchestrates processing**
-- **Feast stores features**
+- **PostgreSQL stores raw time-series data**
 
 ---
 
@@ -107,7 +107,7 @@ Avoid creating services that do multiple unrelated tasks.
 
 The platform follows a standard data lifecycle.
 
-ingestion → transport → transformation → feature storage
+ingestion → transport → transformation → persistence
 
 Responsibilities:
 
@@ -116,7 +116,7 @@ Responsibilities:
 | ingestion | collectors |
 | transport | Kafka |
 | orchestration | Airflow |
-| feature storage | Feast |
+| persistence | PostgreSQL |
 
 Services should respect these boundaries.
 
@@ -153,7 +153,6 @@ The repository is organized into several logical layers.
 infra/
 services/
 airflow/
-feast/
 shared/
 tests/
 scripts/
@@ -216,29 +215,6 @@ DAGs should remain **thin orchestration layers**.
 Avoid placing complex data processing logic inside DAG files.
 
 Instead import reusable modules from services or shared libraries.
-
----
-
-# Feast
-feast/
-
-Contains the feature store configuration.
-
-Typical contents:
-entities
-feature views
-data sources
-feature store configuration
-
-Feast stores features in two layers:
-
-Offline store  
-Historical features for training.
-
-Online store  
-Latest feature values for real-time use.
-
-Materialization moves features from offline storage into the online store.
 
 ---
 
